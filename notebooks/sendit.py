@@ -21,9 +21,11 @@ from hyperopt import fmin, hp
 sys.path.append("..")
 
 output_dir = '/home/tren/dev/segment-anything/notebooks/images/masks'
-sam_checkpoint = "/home/tren/dev/segment-anything/models/sam_vit_b_01ec64.pth"
 device = "cuda:0"
-model_type = "vit_b"
+# sam_checkpoint = "/home/tren/dev/segment-anything/models/sam_vit_b_01ec64.pth"
+# model_type = "vit_b"
+sam_checkpoint = "/home/tren/dev/segment-anything/models/sam_vit_l_0b3195.pth"
+model_type = "vit_l"
 mean = 25
 std_dev = 10
 min_value, max_value = 0, 65
@@ -69,7 +71,7 @@ def make_mask(hparams):
         stability_score_thresh=hparams['stability_score_thresh'],
         crop_n_layers=hparams['crop_n_layers'],
         crop_n_points_downscale_factor=hparams['crop_n_points_downscale_factor'],
-        # min_mask_region_area=hparams['min_mask_region_area'],
+        min_mask_region_area=hparams['min_mask_region_area'],
     )
 
     mask_img = cv2.imread('/home/tren/dev/ashenvenus/data/train/1/inklabels.png', cv2.IMREAD_GRAYSCALE)
@@ -79,6 +81,8 @@ def make_mask(hparams):
 
     slice_dir = '/home/tren/dev/ashenvenus/data/train/1/surface_volume/'
     
+    all_slices = set()
+
     mask_data: MaskData = None
     for j in range(hparams['num_samples']):
 
@@ -87,9 +91,12 @@ def make_mask(hparams):
         # Make sure the starting number is within the valid range and convert it to an integer
         start = int(np.clip(start_float, min_value, max_value - 2))
 
+        slices = [start, start + 1, start + 2]
+        all_slices.update(slices)
+        print(f"Reading slices {slices}...")
+
         img = np.zeros((img_width, img_height, 3), dtype=np.uint8)    
-        for i, slice in enumerate([start, start + 1, start + 2]):
-            print(f"Reading slice {slice}...")
+        for i, slice in enumerate(slices):
             slice_filepath = os.path.join(slice_dir, f"{slice:02d}.tif")
             cv2_img = cv2.imread(slice_filepath, cv2.IMREAD_GRAYSCALE)
             resized_img = cv2.resize(cv2_img, (img_height, img_width))
@@ -108,7 +115,7 @@ def make_mask(hparams):
         mask_data = mask_generator.postprocess_small_regions(
             mask_data,
             mask_generator.min_mask_region_area,
-            max(mask_generator.box_nms_thresh, mask_generator.crop_nms_thresh),
+            hparams['nms_thresh'],
         )
 
     mask_data["segmentations"] = [rle_to_mask(rle) for rle in mask_data["rles"]]
@@ -128,6 +135,7 @@ def make_mask(hparams):
         curr_anns.append(ann)
         
     plt.figure(figsize=(20, 20))
+    plt.title(f"Slices from {'.'.join(str(s) for s in all_slices)}")
     plt.imshow(resized_mask_img)
     show_anns(curr_anns)
     plt.axis('off')
@@ -153,8 +161,7 @@ if __name__ == "__main__":
         "stability_score_thresh": hp.choice("stability_score_thresh", [0.5, 0.7, 0.8, 0.92]),
         "crop_n_layers" : hp.choice("crop_n_layers", [0, 1, 2]),
         "crop_n_points_downscale_factor" : hp.choice("crop_n_points_downscale_factor", [1, 2]),
-        "box_nms_thresh" : hp.choice("box_nms_thresh", [0.5, 0.7, 0.8]),
-        "crop_nms_thresh" : hp.choice("crop_nms_thresh", [0.5, 0.7, 0.8]),
+        "nms_thresh" : hp.choice("nms_thresh", [0.3, 0.5, 0.7]),
         "min_mask_region_area": 100,  # Requires open-cv to run post-processing
     }
 
