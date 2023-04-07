@@ -178,17 +178,18 @@ class FragmentDataset(torch.utils.data.Dataset):
             ]
 
         return {
-            'image': crop.to(device=self.device),
-            'point_coords': point_coords.unsqueeze(0).to(device=device),
-            'point_labels': point_labels.unsqueeze(0).to(device=device),
+            'image': crop.clone().to(device=self.device),
+            'point_coords': point_coords.clone().unsqueeze(0).to(device=device),
+            'point_labels': point_labels.clone().unsqueeze(0).to(device=device),
             'original_size': (self.height_crop, self.width_crop),
             'crop_dims': (start, end)
         }
 
 
 # Train, Valid DataLoader
+device = "cuda:0"
 batch_size = 2
-crop = (3, 224, 224)
+crop = (3, 256, 256)
 num_samples_train = 64
 num_samples_valid = 64
 resize_ratio = 1.0
@@ -198,6 +199,7 @@ train_dataset = FragmentDataset(
     crop=crop,
     resize_ratio=resize_ratio,
     train=True,
+    device=device,
 )
 train_loader = torch.utils.data.DataLoader(
     dataset=train_dataset,
@@ -212,6 +214,7 @@ valid_dataset = FragmentDataset(
     crop=crop,
     resize_ratio=resize_ratio,
     train=True,
+    device=device,
 )
 valid_loader = torch.utils.data.DataLoader(
     dataset=valid_dataset,
@@ -223,7 +226,6 @@ valid_loader = torch.utils.data.DataLoader(
 
 # Model
 checkpoint = "/home/tren/dev/segment-anything/models/sam_vit_b_01ec64.pth"
-device = "cuda:0"
 encoder_embed_dim = 768
 encoder_depth = 12
 encoder_num_heads = 12
@@ -233,39 +235,42 @@ image_size = 1024
 vit_patch_size = 16
 image_embedding_size = image_size // vit_patch_size
 print("Creating Sam model")
+image_encoder=ImageEncoderViT(
+    depth=encoder_depth,
+    embed_dim=encoder_embed_dim,
+    img_size=image_size,
+    mlp_ratio=4,
+    norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
+    num_heads=encoder_num_heads,
+    patch_size=vit_patch_size,
+    qkv_bias=True,
+    use_rel_pos=True,
+    global_attn_indexes=encoder_global_attn_indexes,
+    window_size=14,
+    out_chans=prompt_embed_dim,
+)
+prompt_encoder=PromptEncoder(
+    embed_dim=prompt_embed_dim,
+    image_embedding_size=(image_embedding_size, image_embedding_size),
+    input_image_size=(image_size, image_size),
+    mask_in_chans=16,
+)
+mask_decoder=MaskDecoder(
+    num_multimask_outputs=3,
+    transformer=TwoWayTransformer(
+        depth=2,
+        embedding_dim=prompt_embed_dim,
+        mlp_dim=2048,
+        num_heads=8,
+    ),
+    transformer_dim=prompt_embed_dim,
+    iou_head_depth=3,
+    iou_head_hidden_dim=256,
+)
 sam = Sam(
-    image_encoder=ImageEncoderViT(
-        depth=encoder_depth,
-        embed_dim=encoder_embed_dim,
-        img_size=image_size,
-        mlp_ratio=4,
-        norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
-        num_heads=encoder_num_heads,
-        patch_size=vit_patch_size,
-        qkv_bias=True,
-        use_rel_pos=True,
-        global_attn_indexes=encoder_global_attn_indexes,
-        window_size=14,
-        out_chans=prompt_embed_dim,
-    ),
-    prompt_encoder=PromptEncoder(
-        embed_dim=prompt_embed_dim,
-        image_embedding_size=(image_embedding_size, image_embedding_size),
-        input_image_size=(image_size, image_size),
-        mask_in_chans=16,
-    ),
-    mask_decoder=MaskDecoder(
-        num_multimask_outputs=3,
-        transformer=TwoWayTransformer(
-            depth=2,
-            embedding_dim=prompt_embed_dim,
-            mlp_dim=2048,
-            num_heads=8,
-        ),
-        transformer_dim=prompt_embed_dim,
-        iou_head_depth=3,
-        iou_head_hidden_dim=256,
-    ),
+    image_encoder=image_encoder,
+    prompt_encoder=prompt_encoder,
+    mask_decoder=mask_decoder,
     # TODO: Get from Dataset
     pixel_mean=[123.675, 116.28, 103.53],
     pixel_std=[58.395, 57.12, 57.375],
@@ -278,8 +283,12 @@ sam = sam.to(device=device)
 sam.train()
 print('\n\n\n TRAINABLE PARAMETERS \n\n\n')
 for name, param in sam.named_parameters():
+    if 'iou_prediction_head' in name:
+        param.requires_grad = False
     if param.requires_grad:
         print(f"{name} : {param.shape}")
+# for param in sam.parameters():
+#     param.requires_grad = True
 
 # Optimizer
 lr = 1e-4
@@ -287,7 +296,7 @@ wd = 1e-4
 optimizer = torch.optim.Adam(sam.parameters(), lr=lr, weight_decay=wd)
 
 # Loss
-loss_fn = torch.nn.CrossEntropyLoss()
+loss_fn = torch.nn.BCEWithLogitsLoss()
 
 # Training
 num_epochs = 2
@@ -296,49 +305,71 @@ for epoch in range(num_epochs):
 
     for i, batch in enumerate(train_loader):
         print(f"Batch {i}")
+        with torch.autograd.set_detect_anomaly(True):
+            print(f" batch[0]['image'] {batch[0]['image'].shape}")
+            print(f" batch[0]['image'] {batch[0]['image'].dtype}")
+            # print(f" batch[0]['mask_inputs'] {batch[0]['mask_inputs'].shape}")
+            # print(f" batch[0]['mask_inputs'] {batch[0]['mask_inputs'].dtype}")
+            print(f" batch[0]['original_size'] {batch[0]['original_size']}")
+            start = batch[0]['crop_dims'][0]
+            end = batch[0]['crop_dims'][1]
 
-        print(f" batch[0]['image'] {batch[0]['image'].shape}")
-        print(f" batch[0]['image'] {batch[0]['image'].dtype}")
-        # print(f" batch[0]['mask_inputs'] {batch[0]['mask_inputs'].shape}")
-        # print(f" batch[0]['mask_inputs'] {batch[0]['mask_inputs'].dtype}")
-        print(f" batch[0]['original_size'] {batch[0]['original_size']}")
-        start = batch[0]['crop_dims'][0]
-        end = batch[0]['crop_dims'][1]
+            output = sam(batch, multimask_output=False)
+            """
+            
+            Should Return:
 
-        output = sam(batch, multimask_output=False)
-        """
-        
-        Should Return:
+                (list(dict)): A list over input images, where each element is
+                as dictionary with the following keys.
+                'masks': (torch.Tensor) Batched binary mask predictions,
+                    with shape BxCxHxW, where B is the number of input promts,
+                    C is determiend by multimask_output, and (H, W) is the
+                    original size of the image.
+                'iou_predictions': (torch.Tensor) The model's predictions
+                    of mask quality, in shape BxC.
+                'low_res_logits': (torch.Tensor) Low resolution logits with
+                    shape BxCxHxW, where H=W=256. Can be passed as mask input
+                    to subsequent iterations of prediction.
 
-            (list(dict)): A list over input images, where each element is
-            as dictionary with the following keys.
-              'masks': (torch.Tensor) Batched binary mask predictions,
-                with shape BxCxHxW, where B is the number of input promts,
-                C is determiend by multimask_output, and (H, W) is the
-                original size of the image.
-              'iou_predictions': (torch.Tensor) The model's predictions
-                of mask quality, in shape BxC.
-              'low_res_logits': (torch.Tensor) Low resolution logits with
-                shape BxCxHxW, where H=W=256. Can be passed as mask input
-                to subsequent iterations of prediction.
-
-        """
-        for i, out in enumerate(output):
-            gt_mask = train_dataset.mask[start[1]:end[1], start[2]:end[2]]
-            gt_mask = gt_mask.unsqueeze(0).unsqueeze(0).to(device=device)
-            pred_mask = out['masks'].to(dtype=torch.float32)
-            print(f"Pred Mask Shape: {pred_mask.shape}")
-            print(f"Pred Mask Type: {pred_mask.dtype}")
-            print(f"Pred Mask Max: {pred_mask.max()}")
-            print(f"Pred Mask Min: {pred_mask.min()}")
-            print(f"GT Mask Shape: {gt_mask.shape}")
-            print(f"GT Mask Type: {gt_mask.dtype}")
-            print(f"GT Mask Max: {gt_mask.max()}")
-            print(f"GT Mask Min: {gt_mask.min()}")
-            loss = loss_fn(pred_mask, gt_mask)
-            # Update
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            """
+            for i, out in enumerate(output):
+                print(f"out['low_res_logits'] has grads: {out['low_res_logits'].requires_grad}")
+                print(f"out['low_res_logits'] shape: {out['low_res_logits'].shape}")
+                print(f"out['low_res_logits'] dtype: {out['low_res_logits'].dtype}")
+                print(f"out['low_res_logits'] max: {out['low_res_logits'].max()}")
+                print(f"out['low_res_logits'] min: {out['low_res_logits'].min()}")
+                print(f"out['masks'] has grads: {out['masks'].requires_grad}")
+                print(f"out['masks'] shape: {out['masks'].shape}")
+                print(f"out['masks'] dtype: {out['masks'].dtype}")
+                print(f"out['masks'] max: {out['masks'].max()}")
+                print(f"out['masks'] min: {out['masks'].min()}")
+                print(f"out['iou_predictions'] has grads: {out['iou_predictions'].requires_grad}")
+                print(f"out['iou_predictions'] shape: {out['iou_predictions'].shape}")
+                print(f"out['iou_predictions'] dtype: {out['iou_predictions'].dtype}")
+                print(f"out['iou_predictions'] max: {out['iou_predictions'].max()}")
+                print(f"out['iou_predictions'] min: {out['iou_predictions'].min()}")
+                gt_mask = train_dataset.mask[start[1]:end[1], start[2]:end[2]]
+                gt_mask = gt_mask.clone()
+                gt_mask = gt_mask.unsqueeze(0).unsqueeze(0).to(device=device)
+                # pred_mask = out['masks'].to(dtype=torch.float32)
+                pred_mask = out['low_res_logits'].clone()
+                print(f"Pred Mask has grad: {pred_mask.requires_grad}")
+                print(f"Pred Mask Shape: {pred_mask.shape}")
+                print(f"Pred Mask Type: {pred_mask.dtype}")
+                print(f"Pred Mask Max: {pred_mask.max()}")
+                print(f"Pred Mask Min: {pred_mask.min()}")
+                print(f"GT Mask has grad: {gt_mask.requires_grad}")
+                print(f"GT Mask Shape: {gt_mask.shape}")
+                print(f"GT Mask Type: {gt_mask.dtype}")
+                print(f"GT Mask Max: {gt_mask.max()}")
+                print(f"GT Mask Min: {gt_mask.min()}")
+                loss = loss_fn(pred_mask, gt_mask)
+                print(f"Loss: {loss}")
+                print(f"Loss has grad: {loss.requires_grad}")
+                # Update
+                optimizer.zero_grad()
+            
+                loss.backward()
+                optimizer.step()
 
     # Validation
