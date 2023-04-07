@@ -2,7 +2,7 @@ import numpy as np
 import cv2
 import torch
 import torchviz
-
+import torch.functional as F
 from segment_anything.modeling import (
     ImageEncoderViT,
     MaskDecoder,
@@ -187,9 +187,9 @@ class FragmentDataset(torch.utils.data.Dataset):
 
 
 # Train, Valid DataLoader
-device = "cuda:0"
+device = "cpu" #"cuda:0"
 batch_size = 2
-crop = (3, 256, 256)
+crop = (3, 1024, 1024)
 num_samples_train = 64
 num_samples_valid = 64
 resize_ratio = 1.0
@@ -306,64 +306,54 @@ for epoch in range(num_epochs):
     for i, batch in enumerate(train_loader):
         print(f"Batch {i}")
         with torch.autograd.set_detect_anomaly(True):
-            print(f" batch[0]['image'] {batch[0]['image'].shape}")
-            print(f" batch[0]['image'] {batch[0]['image'].dtype}")
-            # print(f" batch[0]['mask_inputs'] {batch[0]['mask_inputs'].shape}")
-            # print(f" batch[0]['mask_inputs'] {batch[0]['mask_inputs'].dtype}")
-            print(f" batch[0]['original_size'] {batch[0]['original_size']}")
-            start = batch[0]['crop_dims'][0]
-            end = batch[0]['crop_dims'][1]
-
             output = sam(batch, multimask_output=False)
-            """
-            
-            Should Return:
+            for image_record in batch:
+                image = image_record['image']
+                image = image.clone().unsqueeze(0).to(device=device)
+                print(f"image {image.shape}")
+                print(f"image {image.dtype}")
+                start = image_record['crop_dims'][0]
+                end = image_record['crop_dims'][1]
+                if "point_coords" in image_record:
+                    points = (image_record["point_coords"], image_record["point_labels"])
+                else:
+                    points = None
+                image_embeddings = image_encoder(image)
+                sparse_embeddings, dense_embeddings = prompt_encoder(
+                    points=points,
+                    boxes=image_record.get("boxes", None),
+                    masks=image_record.get("mask_inputs", None),
+                )
+                # import pdb; pdb.set_trace()
+                # (Pdb) prompt_encoder.get_dense_pe().shape
+                # torch.Size([1, 256, 64, 64])
+                # (Pdb) image_embeddings.shape
+                # torch.Size([1, 256, 64, 64])
+                # (Pdb) sparse_embeddings.shape
+                # torch.Size([1, 11, 256])
+                # (Pdb) dense_embeddings.shape
+                # torch.Size([1, 256, 64, 64])
 
-                (list(dict)): A list over input images, where each element is
-                as dictionary with the following keys.
-                'masks': (torch.Tensor) Batched binary mask predictions,
-                    with shape BxCxHxW, where B is the number of input promts,
-                    C is determiend by multimask_output, and (H, W) is the
-                    original size of the image.
-                'iou_predictions': (torch.Tensor) The model's predictions
-                    of mask quality, in shape BxC.
-                'low_res_logits': (torch.Tensor) Low resolution logits with
-                    shape BxCxHxW, where H=W=256. Can be passed as mask input
-                    to subsequent iterations of prediction.
+                low_res_masks, iou_predictions = mask_decoder(
+                    image_embeddings=image_embeddings, #.unsqueeze(0),
+                    image_pe=prompt_encoder.get_dense_pe(),
+                    sparse_prompt_embeddings=sparse_embeddings,
+                    dense_prompt_embeddings=dense_embeddings,
+                    multimask_output=False,
+                )
 
-            """
-            for i, out in enumerate(output):
-                print(f"out['low_res_logits'] has grads: {out['low_res_logits'].requires_grad}")
-                print(f"out['low_res_logits'] shape: {out['low_res_logits'].shape}")
-                print(f"out['low_res_logits'] dtype: {out['low_res_logits'].dtype}")
-                print(f"out['low_res_logits'] max: {out['low_res_logits'].max()}")
-                print(f"out['low_res_logits'] min: {out['low_res_logits'].min()}")
-                print(f"out['masks'] has grads: {out['masks'].requires_grad}")
-                print(f"out['masks'] shape: {out['masks'].shape}")
-                print(f"out['masks'] dtype: {out['masks'].dtype}")
-                print(f"out['masks'] max: {out['masks'].max()}")
-                print(f"out['masks'] min: {out['masks'].min()}")
-                print(f"out['iou_predictions'] has grads: {out['iou_predictions'].requires_grad}")
-                print(f"out['iou_predictions'] shape: {out['iou_predictions'].shape}")
-                print(f"out['iou_predictions'] dtype: {out['iou_predictions'].dtype}")
-                print(f"out['iou_predictions'] max: {out['iou_predictions'].max()}")
-                print(f"out['iou_predictions'] min: {out['iou_predictions'].min()}")
                 gt_mask = train_dataset.mask[start[1]:end[1], start[2]:end[2]]
+
+                # Covert to CV2 image
+                gt_mask = gt_mask.clone().numpy()
+                gt_mask = gt_mask.astype(np.uint8)
+                gt_mask = cv2.resize(gt_mask, (256, 256))
+                gt_mask = torch.from_numpy(gt_mask).to(dtype=torch.float32)
+
                 gt_mask = gt_mask.clone()
                 gt_mask = gt_mask.unsqueeze(0).unsqueeze(0).to(device=device)
-                # pred_mask = out['masks'].to(dtype=torch.float32)
-                pred_mask = out['low_res_logits'].clone()
-                print(f"Pred Mask has grad: {pred_mask.requires_grad}")
-                print(f"Pred Mask Shape: {pred_mask.shape}")
-                print(f"Pred Mask Type: {pred_mask.dtype}")
-                print(f"Pred Mask Max: {pred_mask.max()}")
-                print(f"Pred Mask Min: {pred_mask.min()}")
-                print(f"GT Mask has grad: {gt_mask.requires_grad}")
-                print(f"GT Mask Shape: {gt_mask.shape}")
-                print(f"GT Mask Type: {gt_mask.dtype}")
-                print(f"GT Mask Max: {gt_mask.max()}")
-                print(f"GT Mask Min: {gt_mask.min()}")
-                loss = loss_fn(pred_mask, gt_mask)
+
+                loss = loss_fn(low_res_masks, gt_mask)
                 print(f"Loss: {loss}")
                 print(f"Loss has grad: {loss.requires_grad}")
                 # Update
@@ -372,4 +362,59 @@ for epoch in range(num_epochs):
                 loss.backward()
                 optimizer.step()
 
-    # Validation
+            """
+            
+    #         Should Return:
+
+    #             (list(dict)): A list over input images, where each element is
+    #             as dictionary with the following keys.
+    #             'masks': (torch.Tensor) Batched binary mask predictions,
+    #                 with shape BxCxHxW, where B is the number of input promts,
+    #                 C is determiend by multimask_output, and (H, W) is the
+    #                 original size of the image.
+    #             'iou_predictions': (torch.Tensor) The model's predictions
+    #                 of mask quality, in shape BxC.
+    #             'low_res_logits': (torch.Tensor) Low resolution logits with
+    #                 shape BxCxHxW, where H=W=256. Can be passed as mask input
+    #                 to subsequent iterations of prediction.
+
+    #         """
+    #         # for i, out in enumerate(output):
+    #         #     print(f"out['low_res_logits'] has grads: {out['low_res_logits'].requires_grad}")
+    #         #     print(f"out['low_res_logits'] shape: {out['low_res_logits'].shape}")
+    #         #     print(f"out['low_res_logits'] dtype: {out['low_res_logits'].dtype}")
+    #         #     print(f"out['low_res_logits'] max: {out['low_res_logits'].max()}")
+    #         #     print(f"out['low_res_logits'] min: {out['low_res_logits'].min()}")
+    #         #     print(f"out['masks'] has grads: {out['masks'].requires_grad}")
+    #         #     print(f"out['masks'] shape: {out['masks'].shape}")
+    #         #     print(f"out['masks'] dtype: {out['masks'].dtype}")
+    #         #     print(f"out['masks'] max: {out['masks'].max()}")
+    #         #     print(f"out['masks'] min: {out['masks'].min()}")
+    #         #     print(f"out['iou_predictions'] has grads: {out['iou_predictions'].requires_grad}")
+    #         #     print(f"out['iou_predictions'] shape: {out['iou_predictions'].shape}")
+    #         #     print(f"out['iou_predictions'] dtype: {out['iou_predictions'].dtype}")
+    #         #     print(f"out['iou_predictions'] max: {out['iou_predictions'].max()}")
+    #         #     print(f"out['iou_predictions'] min: {out['iou_predictions'].min()}")
+
+    #             # pred_mask = out['masks'].to(dtype=torch.float32)
+    #             pred_mask = out['low_res_logits']
+    #             print(f"Pred Mask has grad: {pred_mask.requires_grad}")
+    #             print(f"Pred Mask Shape: {pred_mask.shape}")
+    #             print(f"Pred Mask Type: {pred_mask.dtype}")
+    #             print(f"Pred Mask Max: {pred_mask.max()}")
+    #             print(f"Pred Mask Min: {pred_mask.min()}")
+    #             print(f"GT Mask has grad: {gt_mask.requires_grad}")
+    #             print(f"GT Mask Shape: {gt_mask.shape}")
+    #             print(f"GT Mask Type: {gt_mask.dtype}")
+    #             print(f"GT Mask Max: {gt_mask.max()}")
+    #             print(f"GT Mask Min: {gt_mask.min()}")
+    #             loss = loss_fn(pred_mask, gt_mask)
+    #             print(f"Loss: {loss}")
+    #             print(f"Loss has grad: {loss.requires_grad}")
+    #             # Update
+    #             optimizer.zero_grad()
+            
+    #             loss.backward()
+    #             optimizer.step()
+
+    # # Validation
