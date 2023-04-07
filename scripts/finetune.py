@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 import torch
+from tqdm import tqdm
 
 from segment_anything.modeling import (
     ImageEncoderViT,
@@ -27,7 +28,8 @@ class FragmentDataset(torch.utils.data.Dataset):
         image_labels_filename='inklabels.png',
         slices_dir_filename='surface_volume',
         # Expected slices per fragment
-        crop: Tuple[int] = (3, 256, 256),
+        crop_size: Tuple[int] = (3, 256, 256),
+        label_size: Tuple[int] = (256, 256),
         # Number of subvolumes to extract from each image
         num_samples: int = 64,
         # Mean and STD for sampling slices
@@ -62,9 +64,10 @@ class FragmentDataset(torch.utils.data.Dataset):
         self.width_original = _mask_img.shape[1]
         self.height_resize = int(self.height_original * self.resize_ratio)
         self.width_resize = int(self.width_original * self.resize_ratio)
-        self.depth_crop = crop[0]
-        self.height_crop = crop[1]
-        self.width_crop = crop[2]
+        self.depth_crop = crop_size[0]
+        self.height_crop = crop_size[1]
+        self.width_crop = crop_size[2]
+        self.label_size = label_size
         mask_img = cv2.resize(_mask_img, (self.width_resize, self.height_resize))
         self.mask = torch.from_numpy(np.array(mask_img)).to(dtype=torch.float32)
         self.mask = torch.nn.functional.pad(
@@ -76,7 +79,7 @@ class FragmentDataset(torch.utils.data.Dataset):
             mode='constant',
             value=0,
         )
-        if train:
+        if self.train:
             # Open Label image
             _image_labels_filepath = os.path.join(data_dir, image_labels_filename)
             _labels_img = cv2.imread(_image_labels_filepath, cv2.IMREAD_GRAYSCALE)
@@ -163,9 +166,9 @@ class FragmentDataset(torch.utils.data.Dataset):
                 value=0,
             )
             crop[i, :, :] = cv2_img[start[1]:end[1], start[2]:end[2]]
+        image = crop.to(device=self.device)
 
         # Choose N random points within the crop
-        self.points_per_crop = 10
         point_coords = torch.zeros((self.points_per_crop, 2), dtype=torch.long)
         point_labels = torch.zeros(self.points_per_crop, dtype=torch.long)
         for i in range(self.points_per_crop):
@@ -175,19 +178,25 @@ class FragmentDataset(torch.utils.data.Dataset):
                 start[1] + point_coords[i, 0],
                 start[2] + point_coords[i, 1],
             ]
-
-        return {
-            'image': crop.clone().to(device=self.device),
-            'point_coords': point_coords.clone().unsqueeze(0).to(device=device),
-            'point_labels': point_labels.clone().unsqueeze(0).to(device=device),
-            'original_size': (self.height_crop, self.width_crop),
-            'crop_dims': (start, end)
-        }
-
+        point_coords = point_coords.to(device=self.device)
+        point_labels = point_labels.to(device=self.device)
+        if self.train:
+            labels = self.labels[
+                    start[1]:end[1],
+                    start[2]:end[2],
+            ]
+            # convert to cv2 image
+            labels = labels.numpy()
+            labels = cv2.resize(labels, self.label_size)
+            labels = torch.from_numpy(labels).to(dtype=torch.float32)
+            labels = labels.unsqueeze(0).clone().to(device=self.device)
+            return image, point_coords, point_labels, labels
+        else:
+            return image, point_coords, point_labels
 
 # Train, Valid DataLoader
 device = "cpu"  # "cuda:0"
-batch_size = 2
+batch_size = 1
 crop = (3, 1024, 1024)
 num_samples_train = 64
 num_samples_valid = 64
@@ -195,14 +204,14 @@ resize_ratio = 1.0
 train_dataset = FragmentDataset(
     data_dir="/home/tren/dev/ashenvenus/data/split_train/1",
     num_samples=num_samples_train,
-    crop=crop,
+    crop_size=crop,
     resize_ratio=resize_ratio,
     train=True,
     device=device,
 )
 train_loader = torch.utils.data.DataLoader(
     dataset=train_dataset,
-    collate_fn=lambda x: x,
+    # collate_fn=lambda x: x,
     batch_size=batch_size,
     shuffle=True,
     # pin_memory=True,
@@ -210,14 +219,14 @@ train_loader = torch.utils.data.DataLoader(
 valid_dataset = FragmentDataset(
     data_dir="/home/tren/dev/ashenvenus/data/split_valid/1",
     num_samples=num_samples_valid,
-    crop=crop,
+    crop_size=crop,
     resize_ratio=resize_ratio,
     train=True,
     device=device,
 )
 valid_loader = torch.utils.data.DataLoader(
     dataset=valid_dataset,
-    collate_fn=lambda x: x,
+    # collate_fn=lambda x: x,
     batch_size=batch_size,
     shuffle=False,
     # pin_memory=True,
@@ -234,42 +243,39 @@ image_size = 1024
 vit_patch_size = 16
 image_embedding_size = image_size // vit_patch_size
 print("Creating Sam model")
-image_encoder = ImageEncoderViT(
-    depth=encoder_depth,
-    embed_dim=encoder_embed_dim,
-    img_size=image_size,
-    mlp_ratio=4,
-    norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
-    num_heads=encoder_num_heads,
-    patch_size=vit_patch_size,
-    qkv_bias=True,
-    use_rel_pos=True,
-    global_attn_indexes=encoder_global_attn_indexes,
-    window_size=14,
-    out_chans=prompt_embed_dim,
-)
-prompt_encoder = PromptEncoder(
-    embed_dim=prompt_embed_dim,
-    image_embedding_size=(image_embedding_size, image_embedding_size),
-    input_image_size=(image_size, image_size),
-    mask_in_chans=16,
-)
-mask_decoder = MaskDecoder(
-    num_multimask_outputs=3,
-    transformer=TwoWayTransformer(
-        depth=2,
-        embedding_dim=prompt_embed_dim,
-        mlp_dim=2048,
-        num_heads=8,
-    ),
-    transformer_dim=prompt_embed_dim,
-    iou_head_depth=3,
-    iou_head_hidden_dim=256,
-)
 sam = Sam(
-    image_encoder=image_encoder,
-    prompt_encoder=prompt_encoder,
-    mask_decoder=mask_decoder,
+    image_encoder = ImageEncoderViT(
+        depth=encoder_depth,
+        embed_dim=encoder_embed_dim,
+        img_size=image_size,
+        mlp_ratio=4,
+        norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
+        num_heads=encoder_num_heads,
+        patch_size=vit_patch_size,
+        qkv_bias=True,
+        use_rel_pos=True,
+        global_attn_indexes=encoder_global_attn_indexes,
+        window_size=14,
+        out_chans=prompt_embed_dim,
+    ),
+    prompt_encoder = PromptEncoder(
+        embed_dim=prompt_embed_dim,
+        image_embedding_size=(image_embedding_size, image_embedding_size),
+        input_image_size=(image_size, image_size),
+        mask_in_chans=16,
+    ),
+    mask_decoder = MaskDecoder(
+        num_multimask_outputs=3,
+        transformer=TwoWayTransformer(
+            depth=2,
+            embedding_dim=prompt_embed_dim,
+            mlp_dim=2048,
+            num_heads=8,
+        ),
+        transformer_dim=prompt_embed_dim,
+        iou_head_depth=3,
+        iou_head_hidden_dim=256,
+    ),
     # TODO: Get from Dataset
     pixel_mean=[123.675, 116.28, 103.53],
     pixel_std=[58.395, 57.12, 57.375],
@@ -280,12 +286,13 @@ if checkpoint is not None:
     sam.load_state_dict(state_dict)
 sam = sam.to(device=device)
 sam.train()
-print('\n\n\n TRAINABLE PARAMETERS \n\n\n')
-for name, param in sam.named_parameters():
-    # if 'iou_prediction_head' in name:
-    #     param.requires_grad = False
-    if param.requires_grad:
-        print(f"{name} : {param.shape}")
+# print('\n\n\n TRAINABLE PARAMETERS \n\n\n')
+# for name, param in sam.named_parameters():
+#     # if 'iou_prediction_head' in name:
+#     #     param.requires_grad = False
+#     # if param.requires_grad:
+#     #     print(f"{name} : {param.shape}")
+#     pass
 
 # Optimizer
 lr = 1e-4
@@ -299,54 +306,26 @@ loss_fn = torch.nn.BCEWithLogitsLoss()
 num_epochs = 2
 for epoch in range(num_epochs):
     print(f"Epoch {epoch}")
-
-    for i, batch in enumerate(train_loader):
-        print(f"Batch {i}")
-        with torch.autograd.set_detect_anomaly(True):
-            output = sam(batch, multimask_output=False)
-            for image_record in batch:
-                image = image_record['image']
-                image = image.clone().unsqueeze(0).to(device=device)
-                print(f"image {image.shape}")
-                print(f"image {image.dtype}")
-                start = image_record['crop_dims'][0]
-                end = image_record['crop_dims'][1]
-                if "point_coords" in image_record:
-                    points = (image_record["point_coords"], image_record["point_labels"])
-                else:
-                    points = None
-                image_embeddings = image_encoder(image)
-                sparse_embeddings, dense_embeddings = prompt_encoder(
-                    points=points,
-                    boxes=image_record.get("boxes", None),
-                    masks=image_record.get("mask_inputs", None),
-                )
-                low_res_masks, iou_predictions = mask_decoder(
-                    image_embeddings=image_embeddings,  # .unsqueeze(0),
-                    image_pe=prompt_encoder.get_dense_pe(),
-                    sparse_prompt_embeddings=sparse_embeddings,
-                    dense_prompt_embeddings=dense_embeddings,
-                    multimask_output=False,
-                )
-
-                gt_mask = train_dataset.mask[start[1]:end[1], start[2]:end[2]]
-
-                # Covert to CV2 image
-                gt_mask = gt_mask.clone().numpy()
-                gt_mask = gt_mask.astype(np.uint8)
-                gt_mask = cv2.resize(gt_mask, (256, 256))
-                gt_mask = torch.from_numpy(gt_mask).to(dtype=torch.float32)
-
-                gt_mask = gt_mask.clone()
-                gt_mask = gt_mask.unsqueeze(0).unsqueeze(0).to(device=device)
-
-                loss = loss_fn(low_res_masks, gt_mask)
-                print(f"Loss: {loss}")
-                print(f"Loss has grad: {loss.requires_grad}")
-                # Update
-                optimizer.zero_grad()
-
-                loss.backward()
-                optimizer.step()
+    for batch in tqdm(train_loader):
+        # import pdb; pdb.set_trace()
+        images, point_coords, point_labels, labels = batch
+        image_embeddings = sam.image_encoder(images)
+        sparse_embeddings, dense_embeddings = sam.prompt_encoder(
+            points=(point_coords, point_labels),
+            boxes=None,
+            masks=None,
+        )
+        # Something goes on here for batch sizes greater than 1
+        low_res_masks, iou_predictions = sam.mask_decoder(
+            image_embeddings=image_embeddings,
+            image_pe=sam.prompt_encoder.get_dense_pe(),
+            sparse_prompt_embeddings=sparse_embeddings,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=False,
+        )
+        loss = loss_fn(low_res_masks, labels)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
     # # Validation
