@@ -1,5 +1,8 @@
 .nfs*
 
+# Generated mask images
+notebooks/images/masks/*
+
 # compilation and distribution
 __pycache__
 _ext
