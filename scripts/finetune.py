@@ -27,6 +27,8 @@ class FragmentDataset(torch.utils.data.Dataset):
         image_mask_filename='mask.png',
         image_labels_filename='inklabels.png',
         slices_dir_filename='surface_volume',
+        # Expected slices per fragment
+        crop: Tuple[int] = (3, 256, 256),
         # Number of subvolumes to extract from each image
         num_samples: int = 64,
         # Mean and STD for sampling slices
@@ -35,19 +37,20 @@ class FragmentDataset(torch.utils.data.Dataset):
         # Min and Max values for sampling slices
         min_value: int = 0,
         max_value: int = 65,
-        # Expected slices per fragment
-        crop: Tuple[int] = (3, 224, 224),
         # Image resize ratio
         resize_ratio: float = 1.0,
         # Training vs Testing mode
         train: bool = True,
         # Device to use
         device: str = 'cuda',
+        # Number of points to sample per crop
+        points_per_crop: int = 20,
     ):
         print('Initializing Dataset')
         self.device = device
         # Train mode also loads the labels
         self.train = train
+        self.points_per_crop = points_per_crop
         # Resize ratio reduces the size of the image
         self.resize_ratio = resize_ratio
         assert os.path.exists(
@@ -56,39 +59,60 @@ class FragmentDataset(torch.utils.data.Dataset):
         _image_mask_filepath = os.path.join(data_dir, image_mask_filename)
         _mask_img = cv2.imread(_image_mask_filepath, cv2.IMREAD_GRAYSCALE)
         # Get original size and resized size
-        self.original_size = _mask_img.shape
-        self.resize_height = int(self.original_size[0] * self.resize_ratio)
-        self.resize_width = int(self.original_size[1] * self.resize_ratio)
-        mask_img = cv2.resize(_mask_img, (self.resize_width, self.resize_height))
-        mask_img = cv2.resize(mask_img, (256, 256))
+        self.height_original = _mask_img.shape[0]
+        self.width_original = _mask_img.shape[1]
+        self.height_resize = int(self.height_original * self.resize_ratio)
+        self.width_resize = int(self.width_original * self.resize_ratio)
+        self.depth_crop = crop[0]
+        self.height_crop = crop[1]
+        self.width_crop = crop[2]
+        mask_img = cv2.resize(_mask_img, (self.width_resize, self.height_resize))
         self.mask = torch.from_numpy(np.array(mask_img)).to(dtype=torch.float32)
+        self.mask = torch.nn.functional.pad(
+            self.mask,
+            (
+                self.height_crop // 2, self.height_crop // 2,
+                self.width_crop // 2, self.width_crop // 2,
+            ),
+            mode='constant',
+            value=0,
+        )
         if train:
             # Open Label image
             _image_labels_filepath = os.path.join(data_dir, image_labels_filename)
             _labels_img = cv2.imread(_image_labels_filepath, cv2.IMREAD_GRAYSCALE)
-            labels_img = cv2.resize(_labels_img, (self.resize_width, self.resize_height))
-            labels_img = cv2.resize(labels_img, (256, 256))
+            labels_img = cv2.resize(_labels_img, (self.width_resize, self.height_resize))
             self.labels = torch.from_numpy(np.array(labels_img)).to(dtype=torch.float32)
+            self.labels = torch.nn.functional.pad(
+                self.labels,
+                (
+                    self.height_crop // 2, self.height_crop // 2,
+                    self.width_crop // 2, self.width_crop // 2,
+                ),
+                mode='constant',
+                value=0,
+            )
 
         self.slice_dir = os.path.join(data_dir, slices_dir_filename)
-
         self.num_samples = num_samples
         self.indices_start = np.zeros((num_samples, 3), dtype=np.int64)
         self.indices_end = np.zeros((num_samples, 3), dtype=np.int64)
         for i in range(num_samples):
 
-            # Select a random number using a Normal distribution with the specified mean and standard deviation
-            start_float = np.random.normal(mean, std_dev)
-            # Make sure the starting number is within the valid range and convert it to an integer
-            z = int(np.clip(start_float, min_value, max_value - 2))
-
             # Select a random starting point for the subvolume
-            x = np.random.randint(0, self.resize_height - crop[1])
-            y = np.random.randint(0, self.resize_width - crop[2])
+            d_start = int(np.clip(np.random.normal(mean, std_dev), min_value, max_value - 2))
+            h_start = np.random.randint(self.height_resize // 2,
+                                        self.height_resize - self.height_crop // 2)
+            w_start = np.random.randint(self.width_resize // 2,
+                                        self.width_resize - self.width_crop // 2)
 
             # Populate the indices matrices
-            self.indices_start[i, :] = [z, x, y]
-            self.indices_end[i, :] = [z + crop[0], x + crop[1], y + crop[2]]
+            self.indices_start[i, :] = [d_start, h_start, w_start]
+            self.indices_end[i, :] = [
+                d_start + self.depth_crop,
+                h_start + self.height_crop,
+                w_start + self.width_crop,
+            ]
 
     def __len__(self):
         return self.num_samples
@@ -120,22 +144,45 @@ class FragmentDataset(torch.utils.data.Dataset):
         """
         start = self.indices_start[idx, :]
         end = self.indices_end[idx, :]
-
-        img = np.zeros((3, self.resize_height, self.resize_width), dtype=np.float32)
+        crop = torch.zeros((
+            self.depth_crop,
+            self.height_crop,
+            self.width_crop,
+        ), dtype=torch.float32)
         for i, slice in enumerate(range(start[0], end[0])):
             slice_filepath = os.path.join(self.slice_dir, f"{slice:02d}.tif")
             cv2_img = cv2.imread(slice_filepath, cv2.IMREAD_GRAYSCALE)
-            resized_img = cv2.resize(cv2_img, (self.resize_width, self.resize_height))
-            img[i, :, :] = resized_img[:, :]
-
-        img = torch.from_numpy(img).to(device=self.device)
-        # Make sure img requires grad
-        img.requires_grad = True
+            cv2_img = cv2.resize(cv2_img, (self.width_resize, self.height_resize))
+            cv2_img = torch.from_numpy(np.array(cv2_img)).to(dtype=torch.float32)
+            cv2_img = torch.nn.functional.pad(
+                cv2_img,
+                (
+                    self.height_crop // 2, self.height_crop // 2,
+                    self.width_crop // 2, self.width_crop // 2,
+                ),
+                mode='constant',
+                value=0,
+            )
+            crop[i, :, :] = cv2_img[start[1]:end[1], start[2]:end[2]]
+        
+        # Choose N random points within the crop
+        self.points_per_crop = 10
+        point_coords = torch.zeros((self.points_per_crop, 2), dtype=torch.long)
+        point_labels = torch.zeros(self.points_per_crop, dtype=torch.long)
+        for i in range(self.points_per_crop):
+            point_coords[i, 0] = np.random.randint(0, self.height_crop)
+            point_coords[i, 1] = np.random.randint(0, self.width_crop)
+            point_labels[i] = self.labels[
+                start[1] + point_coords[i, 0],
+                start[2] + point_coords[i, 1],
+            ]
 
         return {
-            'image': img,
-            'original_size': (self.resize_height, self.resize_width),
-            # 'mask_inputs': None,
+            'image': crop.to(device=self.device),
+            'point_coords': point_coords.unsqueeze(0).to(device=device),
+            'point_labels': point_labels.unsqueeze(0).to(device=device),
+            'original_size': (self.height_crop, self.width_crop),
+            'crop_dims': (start, end)
         }
 
 
@@ -247,15 +294,18 @@ num_epochs = 2
 for epoch in range(num_epochs):
     print(f"Epoch {epoch}")
 
-    gt_mask = train_dataset.labels.to(device=device)
-    gt_mask = gt_mask.unsqueeze(0).unsqueeze(0)
     for i, batch in enumerate(train_loader):
         print(f"Batch {i}")
-        # Forward
-        output = sam(batch, multimask_output=False)
-        # torchviz.make_dot(output[0]['masks'], params=dict(sam.named_parameters())).render("loss", format="png")
 
-        # import pdb; pdb.set_trace()
+        print(f" batch[0]['image'] {batch[0]['image'].shape}")
+        print(f" batch[0]['image'] {batch[0]['image'].dtype}")
+        # print(f" batch[0]['mask_inputs'] {batch[0]['mask_inputs'].shape}")
+        # print(f" batch[0]['mask_inputs'] {batch[0]['mask_inputs'].dtype}")
+        print(f" batch[0]['original_size'] {batch[0]['original_size']}")
+        start = batch[0]['crop_dims'][0]
+        end = batch[0]['crop_dims'][1]
+
+        output = sam(batch, multimask_output=False)
         """
         
         Should Return:
@@ -273,14 +323,19 @@ for epoch in range(num_epochs):
                 to subsequent iterations of prediction.
 
         """
-        for _output in output:
-            pred_mask = _output['low_res_logits'].to(dtype=torch.float32)
-            # pred_mask *= 255.
+        for i, out in enumerate(output):
+            gt_mask = train_dataset.mask[start[1]:end[1], start[2]:end[2]]
+            gt_mask = gt_mask.unsqueeze(0).unsqueeze(0).to(device=device)
+            pred_mask = out['masks'].to(dtype=torch.float32)
             print(f"Pred Mask Shape: {pred_mask.shape}")
+            print(f"Pred Mask Type: {pred_mask.dtype}")
+            print(f"Pred Mask Max: {pred_mask.max()}")
+            print(f"Pred Mask Min: {pred_mask.min()}")
             print(f"GT Mask Shape: {gt_mask.shape}")
+            print(f"GT Mask Type: {gt_mask.dtype}")
+            print(f"GT Mask Max: {gt_mask.max()}")
+            print(f"GT Mask Min: {gt_mask.min()}")
             loss = loss_fn(pred_mask, gt_mask)
-            torchviz.make_dot(loss, params=dict(sam.named_parameters())
-                              ).render("loss", format="png")
             # Update
             optimizer.zero_grad()
             loss.backward()
