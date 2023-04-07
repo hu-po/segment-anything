@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 import torch
+import torchviz
 
 from segment_anything.modeling import (
     ImageEncoderViT,
@@ -40,7 +41,11 @@ class FragmentDataset(torch.utils.data.Dataset):
         resize_ratio: float = 1.0,
         # Training vs Testing mode
         train: bool = True,
+        # Device to use
+        device: str = 'cuda',
     ):
+        print('Initializing Dataset')
+        self.device = device
         # Train mode also loads the labels
         self.train = train
         # Resize ratio reduces the size of the image
@@ -51,23 +56,25 @@ class FragmentDataset(torch.utils.data.Dataset):
         _image_mask_filepath = os.path.join(data_dir, image_mask_filename)
         _mask_img = cv2.imread(_image_mask_filepath, cv2.IMREAD_GRAYSCALE)
         # Get original size and resized size
-        self.original_size = _mask_img.size
+        self.original_size = _mask_img.shape
         self.resize_height = int(self.original_size[0] * self.resize_ratio)
         self.resize_width = int(self.original_size[1] * self.resize_ratio)
-        mask_img = cv2.resize(_mask_img, (self.resize_height, self.resize_width))
-        self.mask = torch.from_numpy(np.array(mask_img)).to(torch.bool)
+        mask_img = cv2.resize(_mask_img, (self.resize_width, self.resize_height))
+        mask_img = cv2.resize(mask_img, (256, 256))
+        self.mask = torch.from_numpy(np.array(mask_img)).to(dtype=torch.float32)
         if train:
             # Open Label image
             _image_labels_filepath = os.path.join(data_dir, image_labels_filename)
             _labels_img = cv2.imread(_image_labels_filepath, cv2.IMREAD_GRAYSCALE)
-            labels_img = cv2.resize(_labels_img, (self.resize_height, self.resize_width))
-            self.labels = torch.from_numpy(np.array(labels_img)).to(torch.bool)
+            labels_img = cv2.resize(_labels_img, (self.resize_width, self.resize_height))
+            labels_img = cv2.resize(labels_img, (256, 256))
+            self.labels = torch.from_numpy(np.array(labels_img)).to(dtype=torch.float32)
 
         self.slice_dir = os.path.join(data_dir, slices_dir_filename)
 
         self.num_samples = num_samples
-        self.indices_start = np.zeros[num_samples, 3]
-        self.indices_end = np.zeros[num_samples, 3]
+        self.indices_start = np.zeros((num_samples, 3), dtype=np.int64)
+        self.indices_end = np.zeros((num_samples, 3), dtype=np.int64)
         for i in range(num_samples):
 
             # Select a random number using a Normal distribution with the specified mean and standard deviation
@@ -76,12 +83,12 @@ class FragmentDataset(torch.utils.data.Dataset):
             z = int(np.clip(start_float, min_value, max_value - 2))
 
             # Select a random starting point for the subvolume
-            x = np.random.randint(0, self.resize_width - crop[2])
-            y = np.random.randint(0, self.resize_height - crop[1])
+            x = np.random.randint(0, self.resize_height - crop[1])
+            y = np.random.randint(0, self.resize_width - crop[2])
 
             # Populate the indices matrices
             self.indices_start[i, :] = [z, x, y]
-            self.indices_end[i, :] = [z + crop[0], x + crop[2], y + crop[1]]
+            self.indices_end[i, :] = [z + crop[0], x + crop[1], y + crop[2]]
 
     def __len__(self):
         return self.num_samples
@@ -114,19 +121,23 @@ class FragmentDataset(torch.utils.data.Dataset):
         start = self.indices_start[idx, :]
         end = self.indices_end[idx, :]
 
-        img = np.zeros((self.resize_width, self.resize_height, 3), dtype=np.uint8)    
+        img = np.zeros((3, self.resize_height, self.resize_width), dtype=np.float32)
         for i, slice in enumerate(range(start[0], end[0])):
             slice_filepath = os.path.join(self.slice_dir, f"{slice:02d}.tif")
             cv2_img = cv2.imread(slice_filepath, cv2.IMREAD_GRAYSCALE)
             resized_img = cv2.resize(cv2_img, (self.resize_width, self.resize_height))
-            img[:, :, i] = resized_img[:, :]
+            img[i, :, :] = resized_img[:, :]
 
-        _dict = {
+        img = torch.from_numpy(img).to(device=self.device)
+        # Make sure img requires grad
+        img.requires_grad = True
+
+        return {
             'image': img,
-            'original_size': (self.resize_width, self.resize_height),
-            'mask_inputs': None,
+            'original_size': (self.resize_height, self.resize_width),
+            # 'mask_inputs': None,
         }
-        return
+
 
 # Train, Valid DataLoader
 batch_size = 2
@@ -134,42 +145,47 @@ crop = (3, 224, 224)
 num_samples_train = 64
 num_samples_valid = 64
 resize_ratio = 1.0
+train_dataset = FragmentDataset(
+    data_dir="/home/tren/dev/ashenvenus/data/split_train/1",
+    num_samples=num_samples_train,
+    crop=crop,
+    resize_ratio=resize_ratio,
+    train=True,
+)
 train_loader = torch.utils.data.DataLoader(
-    dataset=FragmentDataset(
-        data_dir="/home/tren/dev/ashenvenus/data/split_train/1",
-        num_samples=num_samples_train,
-        crop=crop,
-        resize_ratio=resize_ratio,
-        train=True,
-    ),
+    dataset=train_dataset,
+    collate_fn=lambda x: x,
     batch_size=batch_size,
     shuffle=True,
-    pin_memory=True,
+    # pin_memory=True,
+)
+valid_dataset = FragmentDataset(
+    data_dir="/home/tren/dev/ashenvenus/data/split_valid/1",
+    num_samples=num_samples_valid,
+    crop=crop,
+    resize_ratio=resize_ratio,
+    train=True,
 )
 valid_loader = torch.utils.data.DataLoader(
-    dataset=FragmentDataset(
-        data_dir="/home/tren/dev/ashenvenus/data/split_valid/1",
-        num_samples=num_samples_valid,
-        crop=crop,
-        resize_ratio=resize_ratio,
-        train=True,
-    ),
+    dataset=valid_dataset,
+    collate_fn=lambda x: x,
     batch_size=batch_size,
     shuffle=False,
-    pin_memory=True,
+    # pin_memory=True,
 )
 
 # Model
 checkpoint = "/home/tren/dev/segment-anything/models/sam_vit_b_01ec64.pth"
 device = "cuda:0"
-encoder_embed_dim=768
-encoder_depth=12
-encoder_num_heads=12
-encoder_global_attn_indexes=[2, 5, 8, 11]
+encoder_embed_dim = 768
+encoder_depth = 12
+encoder_num_heads = 12
+encoder_global_attn_indexes = [2, 5, 8, 11]
 prompt_embed_dim = 256
 image_size = 1024
 vit_patch_size = 16
 image_embedding_size = image_size // vit_patch_size
+print("Creating Sam model")
 sam = Sam(
     image_encoder=ImageEncoderViT(
         depth=encoder_depth,
@@ -204,15 +220,19 @@ sam = Sam(
         iou_head_hidden_dim=256,
     ),
     # TODO: Get from Dataset
-    # pixel_mean=[123.675, 116.28, 103.53],
-    # pixel_std=[58.395, 57.12, 57.375],
+    pixel_mean=[123.675, 116.28, 103.53],
+    pixel_std=[58.395, 57.12, 57.375],
 )
-sam.train()
 if checkpoint is not None:
     with open(checkpoint, "rb") as f:
         state_dict = torch.load(f)
     sam.load_state_dict(state_dict)
 sam = sam.to(device=device)
+sam.train()
+print('\n\n\n TRAINABLE PARAMETERS \n\n\n')
+for name, param in sam.named_parameters():
+    if param.requires_grad:
+        print(f"{name} : {param.shape}")
 
 # Optimizer
 lr = 1e-4
@@ -223,12 +243,19 @@ optimizer = torch.optim.Adam(sam.parameters(), lr=lr, weight_decay=wd)
 loss_fn = torch.nn.CrossEntropyLoss()
 
 # Training
-num_epochs = 0
+num_epochs = 2
 for epoch in range(num_epochs):
+    print(f"Epoch {epoch}")
 
-    for batch in train_loader:
+    gt_mask = train_dataset.labels.to(device=device)
+    gt_mask = gt_mask.unsqueeze(0).unsqueeze(0)
+    for i, batch in enumerate(train_loader):
+        print(f"Batch {i}")
         # Forward
-        output = sam.forward(batch, multimask_output=False)
+        output = sam(batch, multimask_output=False)
+        # torchviz.make_dot(output[0]['masks'], params=dict(sam.named_parameters())).render("loss", format="png")
+
+        # import pdb; pdb.set_trace()
         """
         
         Should Return:
@@ -246,18 +273,17 @@ for epoch in range(num_epochs):
                 to subsequent iterations of prediction.
 
         """
-
-        output['masks']
-        output['iou_predictions']
-        output['low_res_logits']
-
-        # Backward
-        loss = loss_fn(output['masks'], batch['mask_inputs'])
-
-        # Update
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        for _output in output:
+            pred_mask = _output['low_res_logits'].to(dtype=torch.float32)
+            # pred_mask *= 255.
+            print(f"Pred Mask Shape: {pred_mask.shape}")
+            print(f"GT Mask Shape: {gt_mask.shape}")
+            loss = loss_fn(pred_mask, gt_mask)
+            torchviz.make_dot(loss, params=dict(sam.named_parameters())
+                              ).render("loss", format="png")
+            # Update
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
     # Validation
-    pass
