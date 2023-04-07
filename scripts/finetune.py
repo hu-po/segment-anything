@@ -11,14 +11,16 @@ from segment_anything.modeling import (
     TwoWayTransformer,
 )
 from segment_anything.modeling.sam import Sam
+from segment_anything import sam_model_registry
+from tensorboardX import SummaryWriter
+from torch.utils.data import Dataset, DataLoader
 
 import os
-from functools import partial
 from typing import Tuple
 
 
 # Dataset Class
-class FragmentDataset(torch.utils.data.Dataset):
+class FragmentDataset(Dataset):
     def __init__(
         self,
         # Directory containing the datasets
@@ -31,7 +33,7 @@ class FragmentDataset(torch.utils.data.Dataset):
         crop_size: Tuple[int] = (3, 256, 256),
         label_size: Tuple[int] = (256, 256),
         # Number of subvolumes to extract from each image
-        num_samples: int = 64,
+        num_samples: int = 2,
         # Mean and STD for sampling slices
         mean: float = 30,
         std_dev: float = 10,
@@ -194,138 +196,102 @@ class FragmentDataset(torch.utils.data.Dataset):
         else:
             return image, point_coords, point_labels
 
-# Train, Valid DataLoader
-device = "cpu"  # "cuda:0"
-batch_size = 1
-crop = (3, 1024, 1024)
-num_samples_train = 64
-num_samples_valid = 64
-resize_ratio = 1.0
-train_dataset = FragmentDataset(
-    data_dir="/home/tren/dev/ashenvenus/data/split_train/1",
-    num_samples=num_samples_train,
-    crop_size=crop,
-    resize_ratio=resize_ratio,
-    train=True,
-    device=device,
-)
-train_loader = torch.utils.data.DataLoader(
-    dataset=train_dataset,
-    # collate_fn=lambda x: x,
-    batch_size=batch_size,
-    shuffle=True,
-    # pin_memory=True,
-)
-valid_dataset = FragmentDataset(
-    data_dir="/home/tren/dev/ashenvenus/data/split_valid/1",
-    num_samples=num_samples_valid,
-    crop_size=crop,
-    resize_ratio=resize_ratio,
-    train=True,
-    device=device,
-)
-valid_loader = torch.utils.data.DataLoader(
-    dataset=valid_dataset,
-    # collate_fn=lambda x: x,
-    batch_size=batch_size,
-    shuffle=False,
-    # pin_memory=True,
-)
+def train_valid(
+    output_dir: str = "output/train",
+    train_dir: str = "/home/tren/dev/ashenvenus/data/split_train/1",
+    valid_dir: str = "/home/tren/dev/ashenvenus/data/split_valid/1",
+    model: str = "vit_b",
+    weights_filepath: str = "/home/tren/dev/segment-anything/models/sam_vit_b_01ec64.pth",
+    num_samples_train: int = 2,
+    num_samples_valid: int = 2,
+    batch_size: int = 1,
+    optimizer: str = "adam",
+    lr: float = 1e-4,
+    wd: float = 1e-4,
+    image_augs: bool = False,
+    crop_size: Tuple[int] = (3, 1024, 1024),
+    resize_ratio: float = 1.0,
+    num_epochs: int = 2,
+    save_model: bool = True,
+    device: str = "cpu",  # "cuda:0"
+    **kwargs,
+):
+    train_dataset = FragmentDataset(
+        data_dir=train_dir,
+        num_samples=num_samples_train,
+        crop_size=crop_size,
+        resize_ratio=resize_ratio,
+        train=True,
+        device=device,
+    )
+    train_loader = DataLoader(
+        dataset=train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        # pin_memory=True,
+    )
+    valid_dataset = FragmentDataset(
+        data_dir=valid_dir,
+        num_samples=num_samples_valid,
+        crop_size=crop_size,
+        resize_ratio=resize_ratio,
+        train=True,
+        device=device,
+    )
+    valid_loader = DataLoader(
+        dataset=valid_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        # pin_memory=True,
+    )
 
-# Model
-checkpoint = "/home/tren/dev/segment-anything/models/sam_vit_b_01ec64.pth"
-encoder_embed_dim = 768
-encoder_depth = 12
-encoder_num_heads = 12
-encoder_global_attn_indexes = [2, 5, 8, 11]
-prompt_embed_dim = 256
-image_size = 1024
-vit_patch_size = 16
-image_embedding_size = image_size // vit_patch_size
-print("Creating Sam model")
-sam = Sam(
-    image_encoder = ImageEncoderViT(
-        depth=encoder_depth,
-        embed_dim=encoder_embed_dim,
-        img_size=image_size,
-        mlp_ratio=4,
-        norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
-        num_heads=encoder_num_heads,
-        patch_size=vit_patch_size,
-        qkv_bias=True,
-        use_rel_pos=True,
-        global_attn_indexes=encoder_global_attn_indexes,
-        window_size=14,
-        out_chans=prompt_embed_dim,
-    ),
-    prompt_encoder = PromptEncoder(
-        embed_dim=prompt_embed_dim,
-        image_embedding_size=(image_embedding_size, image_embedding_size),
-        input_image_size=(image_size, image_size),
-        mask_in_chans=16,
-    ),
-    mask_decoder = MaskDecoder(
-        num_multimask_outputs=3,
-        transformer=TwoWayTransformer(
-            depth=2,
-            embedding_dim=prompt_embed_dim,
-            mlp_dim=2048,
-            num_heads=8,
-        ),
-        transformer_dim=prompt_embed_dim,
-        iou_head_depth=3,
-        iou_head_hidden_dim=256,
-    ),
-    # TODO: Get from Dataset
-    pixel_mean=[123.675, 116.28, 103.53],
-    pixel_std=[58.395, 57.12, 57.375],
-)
-if checkpoint is not None:
-    with open(checkpoint, "rb") as f:
-        state_dict = torch.load(f)
-    sam.load_state_dict(state_dict)
-sam = sam.to(device=device)
-sam.train()
-# print('\n\n\n TRAINABLE PARAMETERS \n\n\n')
-# for name, param in sam.named_parameters():
-#     # if 'iou_prediction_head' in name:
-#     #     param.requires_grad = False
-#     # if param.requires_grad:
-#     #     print(f"{name} : {param.shape}")
-#     pass
+    model = sam_model_registry[model](checkpoint=weights_filepath)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+    loss_fn = torch.nn.BCEWithLogitsLoss()
 
-# Optimizer
-lr = 1e-4
-wd = 1e-4
-optimizer = torch.optim.Adam(sam.parameters(), lr=lr, weight_decay=wd)
+    os.makedirs(output_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=output_dir)
 
-# Loss
-loss_fn = torch.nn.BCEWithLogitsLoss()
+    step = 0
+    num_epochs = 2
+    for epoch in range(num_epochs):
+        print(f"Epoch {epoch}")
+        loader = tqdm(train_loader)
+        for batch in loader:
+            images, point_coords, point_labels, labels = batch
+            image_embeddings = model.image_encoder(images)
+            sparse_embeddings, dense_embeddings = model.prompt_encoder(
+                points=(point_coords, point_labels),
+                boxes=None,
+                masks=None,
+            )
+            # Something goes on here for batch sizes greater than 1
+            low_res_masks, iou_predictions = model.mask_decoder(
+                image_embeddings=image_embeddings,
+                image_pe=model.prompt_encoder.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=False,
+            )
+            loss = loss_fn(low_res_masks, labels)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            step += 1
 
-# Training
-num_epochs = 2
-for epoch in range(num_epochs):
-    print(f"Epoch {epoch}")
-    for batch in tqdm(train_loader):
-        # import pdb; pdb.set_trace()
-        images, point_coords, point_labels, labels = batch
-        image_embeddings = sam.image_encoder(images)
-        sparse_embeddings, dense_embeddings = sam.prompt_encoder(
-            points=(point_coords, point_labels),
-            boxes=None,
-            masks=None,
-        )
-        # Something goes on here for batch sizes greater than 1
-        low_res_masks, iou_predictions = sam.mask_decoder(
-            image_embeddings=image_embeddings,
-            image_pe=sam.prompt_encoder.get_dense_pe(),
-            sparse_prompt_embeddings=sparse_embeddings,
-            dense_prompt_embeddings=dense_embeddings,
-            multimask_output=False,
-        )
-        loss = loss_fn(low_res_masks, labels)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            loss_name = f"Train.{loss_fn.__class__.__name__}"
+            writer.add_scalar(loss_name, loss.item(), step)
+            loader.set_postfix_str(f"{loss_name}: {loss.item():.4f}")
+        
+        if save_model:
+            _model_filepath = os.path.join(output_dir, f"model_{epoch}.pth")
+            print(f"Saving model to {_model_filepath}")
+            torch.save(model.state_dict(), _model_filepath)
 
-    # # Validation
+    writer.close()
+        # # Validation
+
+if __name__ == "__main__":
+    
+    
+    train_valid()
