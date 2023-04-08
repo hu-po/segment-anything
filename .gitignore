@@ -3,6 +3,9 @@
 # Generated mask images
 notebooks/images/masks/*
 
+# Output folder
+output/
+
 # compilation and distribution
 __pycache__
 _ext

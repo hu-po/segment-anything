@@ -8,13 +8,13 @@ from segment_anything import sam_model_registry
 import gc
 import os
 import pprint
+import shutil
 import uuid
 import yaml
+from hyperopt import fmin, hp, tpe
 from tensorboardX import SummaryWriter
 from tqdm import tqdm
-from typing import Tuple, Dict
-from hyperopt import hp, fmin, tpe
-import shutil
+from typing import Dict, Tuple
 
 if os.name == 'nt':
     print("Windows Computer Detected")
@@ -36,8 +36,8 @@ HYPERPARAMS = {
     # Model
     'model_str': hp.choice('model_str', [
         'vit_b|sam_vit_b_01ec64.pth',
-        'vit_h|sam_vit_h_4b8939.pth',
-        'vit_l|sam_vit_l_0b3195.pth',
+        # 'vit_h|sam_vit_h_4b8939.pth',
+        # 'vit_l|sam_vit_l_0b3195.pth',
     ]),
 
     # Dataset
@@ -48,13 +48,13 @@ HYPERPARAMS = {
         # '123',
     ]),
     'num_samples_train': hp.choice('num_samples_train', [
-        32,
+        8,
     ]),
     'num_samples_valid': hp.choice('num_samples_valid', [
-        10,
+        8,
     ]),
     'crop_size_str': hp.choice('crop_size_str', [
-        '3.224.224'
+        '3.68.68',
         '3.224.224',
     ]),
     'label_size_str': hp.choice('label_size_str', [
@@ -91,7 +91,7 @@ class FragmentDataset(Dataset):
         # Directory containing the dataset
         data_dir: str,
         # Number of random crops to take from fragment volume
-        dataset_size: int = 16,
+        dataset_size: int = 2,
         # Number of points to sample per crop
         points_per_crop: int = 4,
         # Filenames of the images we'll use
@@ -156,17 +156,17 @@ class FragmentDataset(Dataset):
         start = self.indices[idx, 0, :]
         end = self.indices[idx, 1, :]
         # Load the relevant slices and pack into image tensor
-        image = torch.zeros(self.crop_size, dtype=torch.float32)
+        image = np.zeros(self.crop_size, dtype=np.float32)
         for i, _depth in enumerate(range(start[0], end[0])):
             _slice_filepath = os.path.join(self.slice_dir, f"{_depth:02d}.tif")
             _slice = np.array(cv2.imread(_slice_filepath, cv2.IMREAD_GRAYSCALE)).astype(np.float32)
             image[i, :, :] = _slice[start[1]: end[1], start[2]: end[2]]
-        image = image.to(device=self.device)
+        image = torch.from_numpy(image).to(device=self.device)
 
         # Choose Points within the crop for SAM to sample
-        point_coords = torch.zeros((self.points_per_crop, 2), dtype=torch.long)
+        point_coords = np.zeros((self.points_per_crop, 2), dtype=np.int64)
         # TODO: What is the datatype for labels? One-hot? Binary?
-        point_labels = torch.zeros(self.points_per_crop, dtype=torch.bool)
+        point_labels = np.zeros(self.points_per_crop, dtype=np.bool)
         for i in range(self.points_per_crop):
             point_coords[i, 0] = np.random.randint(0, self.crop_size[1])
             point_coords[i, 1] = np.random.randint(0, self.crop_size[2])
@@ -174,9 +174,8 @@ class FragmentDataset(Dataset):
                 start[1] + point_coords[i, 0],
                 start[2] + point_coords[i, 1],
             ]
-        
-        point_coords = point_coords.to(device=self.device)
-        point_labels = point_labels.to(device=self.device)
+        point_coords = torch.from_numpy(point_coords).to(device=self.device)
+        point_labels = torch.from_numpy(point_labels).to(device=self.device)
 
         if self.train:
             label = self.labels[start[1]:end[1], start[2]:end[2]]
@@ -188,6 +187,7 @@ class FragmentDataset(Dataset):
             return image, point_coords, point_labels
 
 def train_valid(
+    run_name: str = "testytest",
     output_dir: str = None,
     train_dir: str = None,
     valid_dir: str = None,
@@ -207,7 +207,7 @@ def train_valid(
     writer: SummaryWriter = None,
     # Dataset
     curriculum: str = "1",
-    crop_size: Tuple[int] = (3, 1024, 1024),
+    crop_size: Tuple[int] = (3, 68, 68),
     label_size: Tuple[int] = (1024, 1024),
     points_per_crop: int = 8,
     avg_depth: float = 27.,
@@ -244,7 +244,7 @@ def train_valid(
                 dataset=_dataset,
                 batch_size=batch_size,
                 shuffle=True,
-                pin_memory=True,
+                # pin_memory=True,
             )
             _loader = tqdm(_dataloader)
             for images, point_coords, point_labels, labels in _loader:
@@ -305,7 +305,7 @@ def train_valid(
                 dataset=_dataset,
                 batch_size=batch_size,
                 shuffle=False,
-                pin_memory=True,
+                # pin_memory=True,
             )
             _score_name = f'score/valid/{_dataset_id}'
             if _score_name not in best_score_dict:
@@ -344,7 +344,7 @@ def train_valid(
                 print(f"New best score! >> {score:.4f} (was {best_score_dict[_score_name]:.4f})")        
                 best_score_dict[_score_name] = score
                 if save_model:
-                    _model_filepath = os.path.join(output_dir, f"model_best_{_dataset_id}.pth")
+                    _model_filepath = os.path.join(output_dir, f"model_{run_name}best_{_dataset_id}.pth")
                     print(f"Saving model to {_model_filepath}")
                     torch.save(model.state_dict(), _model_filepath)
 
@@ -382,6 +382,7 @@ def sweep_episode(hparams) -> float:
         writer = SummaryWriter(log_dir=output_dir)
         # Train and evaluate a TFLite model
         score_dict = train_valid(
+            run_name =run_name,
             output_dir = output_dir,
             train_dir = train_dir,
             valid_dir = valid_dir,
@@ -396,8 +397,9 @@ def sweep_episode(hparams) -> float:
         score = sum(score_dict.values()) / len(score_dict)
     except Exception as e:
         print(f"\n\n (ERROR) EPISODE FAILED (ERROR) \n\n")
-        print(e)
         print(f"Potentially Bad Hyperparams:\n\n{pprint.pformat(hparams)}\n\n")
+        raise e
+        print(e)
         score = 0
     # Maximize score is minimize negative score
     return -score
