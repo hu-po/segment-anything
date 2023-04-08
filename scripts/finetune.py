@@ -1,22 +1,87 @@
 import numpy as np
 import cv2
 import torch
-from tqdm import tqdm
+from torch.utils.data import DataLoader, Dataset
 
-from segment_anything.modeling import (
-    ImageEncoderViT,
-    MaskDecoder,
-    PromptEncoder,
-    Sam,
-    TwoWayTransformer,
-)
-from segment_anything.modeling.sam import Sam
 from segment_anything import sam_model_registry
-from tensorboardX import SummaryWriter
-from torch.utils.data import Dataset, DataLoader
 
+import gc
 import os
-from typing import Tuple
+import pprint
+import uuid
+import yaml
+from tensorboardX import SummaryWriter
+from tqdm import tqdm
+from typing import Tuple, Dict
+from hyperopt import hp, fmin, tpe
+import shutil
+
+if os.name == 'nt':
+    print("Windows Computer Detected")
+    ROOT_DIR = "C:\\Users\\ook\\Documents\\dev\\"
+    DATA_DIR = "C:\\Users\\ook\\Documents\\dev\\ashenvenus\\data"
+    MODEL_DIR = "C:\\Users\\ook\\Documents\\dev\\segment-anything\\models"
+    OUTPUT_DIR = "C:\\Users\\ook\\Documents\\dev\\segment-anything\\output"
+else:
+    print("Linux Computer Detected")
+    ROOT_DIR = "/home/tren/dev/"
+    DATA_DIR = "/home/tren/dev/ashenvenus/data"
+    MODEL_DIR = "/home/tren/dev/segment-anything/models"
+    OUTPUT_DIR = "/home/tren/dev/segment-anything/output"
+
+# Define the search space
+HYPERPARAMS = {
+    'train_dir_name' : 'split_train',
+    'valid_dir_name' : 'split_valid',
+    # Model
+    'model_str': hp.choice('model_str', [
+        'vit_b|sam_vit_b_01ec64.pth',
+        'vit_h|sam_vit_h_4b8939.pth',
+        'vit_l|sam_vit_l_0b3195.pth',
+    ]),
+
+    # Dataset
+    'curriculum': hp.choice('curriculum', [
+        '1',
+        '2',
+        '3',
+        # '123',
+    ]),
+    'num_samples_train': hp.choice('num_samples_train', [
+        32,
+    ]),
+    'num_samples_valid': hp.choice('num_samples_valid', [
+        10,
+    ]),
+    'crop_size_str': hp.choice('crop_size_str', [
+        '3.224.224'
+        '3.224.224',
+    ]),
+    'label_size_str': hp.choice('label_size_str', [
+        '256.256', # HACK: This cannot be changed for pretrained models
+    ]),
+
+    # Training
+    'batch_size' : 1,
+    'num_epochs': hp.choice('num_epochs', [2]),
+    'lr': hp.loguniform('lr',np.log(0.00001), np.log(0.01)),
+    'wd': hp.choice('wd', [
+        1e-4,
+        1e-3,
+    ]),
+}
+
+
+def get_device(device: str = None):
+    if device == None or device == "gpu":
+        if torch.cuda.is_available():
+            print("Using GPU")
+            print('Clearing GPU memory')
+            torch.cuda.empty_cache()
+            gc.collect()
+            return torch.device("cuda")
+    print("Using CPU")
+    return torch.device("cpu")
 
 
 # Dataset Class
@@ -34,13 +99,13 @@ class FragmentDataset(Dataset):
         image_labels_filename='inklabels.png',
         slices_dir_filename='surface_volume',
         # Expected slices per fragment
-        crop_size: Tuple[int] = (3, 256, 256),
+        crop_size: Tuple[int] = (3, 68, 68),
         label_size: Tuple[int] = (256, 256),
         # Depth in scan is a Clipped Normal distribution
         min_depth: int = 0,
         max_depth: int = 65,
-        avg_depth: float = 27,
-        std_depth: float = 10,
+        avg_depth: float = 27.,
+        std_depth: float = 10.,
         # Training vs Testing mode
         train: bool = True,
         # Device to use
@@ -70,8 +135,8 @@ class FragmentDataset(Dataset):
         for i in range(dataset_size):
             # Select a random starting point for the subvolume
             _depth = int(np.clip(np.random.normal(avg_depth, std_depth), min_depth, max_depth))
-            _height = np.random.randint(self.crop_size[1] // 2, self.original_size[0] - self.crop_size[1] // 2)
-            _width = np.random.randint(self.crop_size[2] // 2, self.original_size[1] - self.crop_size[2] // 2)
+            _height = np.random.randint(0, self.original_size[0])
+            _width = np.random.randint(0, self.original_size[1])
             self.indices[i, 0, :] = [_depth, _height, _width]
             # End point is start point + crop size
             self.indices[i, 1, :] = [
@@ -95,191 +160,258 @@ class FragmentDataset(Dataset):
         for i, _depth in enumerate(range(start[0], end[0])):
             _slice_filepath = os.path.join(self.slice_dir, f"{_depth:02d}.tif")
             _slice = np.array(cv2.imread(_slice_filepath, cv2.IMREAD_GRAYSCALE)).astype(np.float32)
-            image[i, :, :] = _slice[
-                start[1] + self.crop_size[1] // 2 : end[1] - self.crop_size[1] // 2,
-                start[2] + self.crop_size[2] // 2 : end[2] - self.crop_size[2] // 2,
-            ]
+            image[i, :, :] = _slice[start[1]: end[1], start[2]: end[2]]
         image = image.to(device=self.device)
-        
 
         # Choose Points within the crop for SAM to sample
         point_coords = torch.zeros((self.points_per_crop, 2), dtype=torch.long)
-        point_labels = torch.zeros(self.points_per_crop, dtype=torch.long)
+        # TODO: What is the datatype for labels? One-hot? Binary?
+        point_labels = torch.zeros(self.points_per_crop, dtype=torch.bool)
         for i in range(self.points_per_crop):
-            point_coords[i, 0] = np.random.randint(0, self.height_crop)
-            point_coords[i, 1] = np.random.randint(0, self.width_crop)
+            point_coords[i, 0] = np.random.randint(0, self.crop_size[1])
+            point_coords[i, 1] = np.random.randint(0, self.crop_size[2])
             point_labels[i] = self.labels[
                 start[1] + point_coords[i, 0],
                 start[2] + point_coords[i, 1],
             ]
+        
         point_coords = point_coords.to(device=self.device)
         point_labels = point_labels.to(device=self.device)
+
         if self.train:
-            labels = self.labels[
-                    start[1]:end[1],
-                    start[2]:end[2],
-            ]
-            # convert to cv2 image
-            labels = labels.numpy()
-            labels = cv2.resize(labels, self.label_size)
-            labels = torch.from_numpy(labels).to(dtype=torch.float32)
-            labels = labels.unsqueeze(0).clone().to(device=self.device)
-            return image, point_coords, point_labels, labels
+            label = self.labels[start[1]:end[1], start[2]:end[2]]
+            label = cv2.resize(label.astype(np.uint8), self.label_size, interpolation=cv2.INTER_NEAREST)
+            label = torch.from_numpy(label).to(dtype=torch.bool)
+            label = label.unsqueeze(0).clone().to(device=self.device)
+            return image, point_coords, point_labels, label
         else:
             return image, point_coords, point_labels
 
 def train_valid(
-    output_dir: str = "/home/tren/dev/segment-anything/output/train",
-    train_dir: str = "/home/tren/dev/ashenvenus/data/split_train/1",
-    valid_dir: str = "/home/tren/dev/ashenvenus/data/split_valid/1",
+    output_dir: str = None,
+    train_dir: str = None,
+    valid_dir: str = None,
+    # Model
     model: str = "vit_b",
-    weights_filepath: str = "/home/tren/dev/segment-anything/models/sam_vit_b_01ec64.pth",
+    weights_filepath: str = "path/to/model.pth",
+    save_model: bool = True,
+    # Training
+    device: str = None,
     num_samples_train: int = 2,
     num_samples_valid: int = 2,
+    num_epochs: int = 2,
     batch_size: int = 1,
     optimizer: str = "adam",
     lr: float = 1e-4,
     wd: float = 1e-4,
-    image_augs: bool = False,
+    writer: SummaryWriter = None,
+    # Dataset
+    curriculum: str = "1",
     crop_size: Tuple[int] = (3, 1024, 1024),
-    resize_ratio: float = 1.0,
-    num_epochs: int = 2,
-    save_model: bool = True,
-    device: str = "cpu",  # "cuda:0"
+    label_size: Tuple[int] = (1024, 1024),
+    points_per_crop: int = 8,
+    avg_depth: float = 27.,
+    std_depth: float = 10.,
     **kwargs,
 ):
-    train_dataset = FragmentDataset(
-        data_dir=train_dir,
-        dataset_size=num_samples_train,
-        crop_size=crop_size,
-        resize_ratio=resize_ratio,
-        train=True,
-        device=device,
-    )
-    train_loader = DataLoader(
-        dataset=train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        # pin_memory=True,
-    )
-    valid_dataset = FragmentDataset(
-        data_dir=valid_dir,
-        dataset_size=num_samples_valid,
-        crop_size=crop_size,
-        resize_ratio=resize_ratio,
-        train=True,
-        device=device,
-    )
-    valid_loader = DataLoader(
-        dataset=valid_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        # pin_memory=True,
-    )
-
+    device = get_device(device)  
+    # TODO: Select only a subset of model parameters to train
     model = sam_model_registry[model](checkpoint=weights_filepath)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
     loss_fn = torch.nn.BCEWithLogitsLoss()
 
-    os.makedirs(output_dir, exist_ok=True)
-    writer = SummaryWriter(log_dir=output_dir)
-
     step = 0
-    score = 0    
-    best_score = 0
+    best_score_dict: Dict[str, float] = {}
     for epoch in range(num_epochs):
         print(f"\n\n --- Epoch {epoch} --- \n\n")
 
-        print("Training...")
-        score = 0
-        _loader = tqdm(train_loader)
-        for images, point_coords, point_labels, labels in _loader:
-            writer.add_images("input.image/train", images, step)
-            writer.add_images("input.label/train", labels, step)
-            # # Plot point coordinates into a blank image of size images
-            # point_coords = point_coords.cpu().numpy()
-            # point_labels = point_labels.cpu().numpy()
-            # point_image = np.zeros(images.shape)
-            # for i in range(point_coords.shape[0]):
-            #     point_image[0, point_coords[i, 0], point_coords[i, 1]] = point_labels[i]
-            # writer.add_images("Train.Points", point_image, step)
-            image_embeddings = model.image_encoder(images)
-            sparse_embeddings, dense_embeddings = model.prompt_encoder(
-                points=(point_coords, point_labels),
-                boxes=None,
-                masks=None,
+        # Training
+        for _dataset_id in curriculum:
+            _dataset_filepath = os.path.join(train_dir, _dataset_id)
+            print(f"Training on {_dataset_filepath} ...")
+            _dataset = FragmentDataset(
+                data_dir=_dataset_filepath,
+                dataset_size=num_samples_train,
+                points_per_crop = points_per_crop,
+                crop_size = crop_size,
+                label_size = label_size,
+                avg_depth = avg_depth,
+                std_depth = std_depth,
+                train = True,
+                device = device,
             )
-            # HACK: Something goes on here for batch sizes greater than 1
-            # TODO: iou predictions could be used for additional loss
-            low_res_masks, iou_predictions = model.mask_decoder(
-                image_embeddings=image_embeddings,
-                image_pe=model.prompt_encoder.get_dense_pe(),
-                sparse_prompt_embeddings=sparse_embeddings,
-                dense_prompt_embeddings=dense_embeddings,
-                multimask_output=False,
+            _dataloader = DataLoader(
+                dataset=_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                pin_memory=True,
             )
-            writer.add_images("output.masks/train", low_res_masks, step)
-            loss = loss_fn(low_res_masks, labels)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            step += 1
+            _loader = tqdm(_dataloader)
+            for images, point_coords, point_labels, labels in _loader:
+                if writer:
+                    writer.add_images("input.image/train", images, step)
+                    writer.add_images("input.label/train", labels, step)
+                # # Plot point coordinates into a blank image of size images
+                # point_coords = point_coords.cpu().numpy()
+                # point_labels = point_labels.cpu().numpy()
+                # point_image = np.zeros(images.shape)
+                # for i in range(point_coords.shape[0]):
+                #     point_image[0, point_coords[i, 0], point_coords[i, 1]] = point_labels[i]
+                # writer.add_images("Train.Points", point_image, step)
+                image_embeddings = model.image_encoder(images)
+                sparse_embeddings, dense_embeddings = model.prompt_encoder(
+                    points=(point_coords, point_labels),
+                    boxes=None,
+                    masks=None,
+                )
+                # HACK: Something goes on here for batch sizes greater than 1
+                # TODO: iou predictions could be used for additional loss
+                low_res_masks, iou_predictions = model.mask_decoder(
+                    image_embeddings=image_embeddings,
+                    image_pe=model.prompt_encoder.get_dense_pe(),
+                    sparse_prompt_embeddings=sparse_embeddings,
+                    dense_prompt_embeddings=dense_embeddings,
+                    multimask_output=False,
+                )
+                if writer:
+                    writer.add_images("output.masks/train", low_res_masks, step)
+                loss = loss_fn(low_res_masks, labels)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                step += 1
 
-            _loss_name = f"{loss_fn.__class__.__name__}/train"
-            writer.add_scalar(f"{_loss_name}", loss.item(), step)
-            _loader.set_postfix_str(f"{_loss_name}: {loss.item():.4f}")
-        
-        print("Validating...")
-        score = 0
-        _loader = tqdm(valid_loader)
-        for images, point_coords, point_labels, labels in _loader:
-            writer.add_images("input.image/valid", images, step)
-            writer.add_images("input.label/valid", labels, step)
-            image_embeddings = model.image_encoder(images)
-            sparse_embeddings, dense_embeddings = model.prompt_encoder(
-                points=(point_coords, point_labels),
-                boxes=None,
-                masks=None,
+                _loss_name = f"{loss_fn.__class__.__name__}/train"
+                writer.add_scalar(f"{_loss_name}", loss.item(), step)
+                _loader.set_postfix_str(f"{_loss_name}: {loss.item():.4f}")
+            
+        # Validation
+        #   - Will overwrite the dataset and dataloader objects
+        for _dataset_id in curriculum:
+            _dataset_filepath = os.path.join(valid_dir, _dataset_id)
+            print(f"Validating on dataset: {_dataset_filepath}")
+            _dataset = FragmentDataset(
+                data_dir=_dataset_filepath,
+                dataset_size=num_samples_valid,
+                points_per_crop = points_per_crop,
+                crop_size = crop_size,
+                label_size = label_size,
+                avg_depth = avg_depth,
+                std_depth = std_depth,
+                train = True,
+                device = device,
             )
-            low_res_masks, iou_predictions = model.mask_decoder(
-                image_embeddings=image_embeddings,
-                image_pe=model.prompt_encoder.get_dense_pe(),
-                sparse_prompt_embeddings=sparse_embeddings,
-                dense_prompt_embeddings=dense_embeddings,
-                multimask_output=False,
+            _dataloader = DataLoader(
+                dataset=_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                pin_memory=True,
             )
-            writer.add_images("output.masks/valid", low_res_masks, step)
-            loss = loss_fn(low_res_masks, labels)
-            score -= loss.item()
+            _score_name = f'score/valid/{_dataset_id}'
+            if _score_name not in best_score_dict:
+                best_score_dict[_score_name] = 0
+            score = 0
+            _loader = tqdm(_dataloader)
+            for images, point_coords, point_labels, labels in _loader:
+                if writer:
+                    writer.add_images(f"input.image/valid/{_dataset_id}", images, step)
+                    writer.add_images(f"input.label/valid/{_dataset_id}", labels, step)
+                image_embeddings = model.image_encoder(images)
+                sparse_embeddings, dense_embeddings = model.prompt_encoder(
+                    points=(point_coords, point_labels),
+                    boxes=None,
+                    masks=None,
+                )
+                low_res_masks, iou_predictions = model.mask_decoder(
+                    image_embeddings=image_embeddings,
+                    image_pe=model.prompt_encoder.get_dense_pe(),
+                    sparse_prompt_embeddings=sparse_embeddings,
+                    dense_prompt_embeddings=dense_embeddings,
+                    multimask_output=False,
+                )
+                if writer:
+                    writer.add_images(f"output.masks/valid/{_dataset_id}", low_res_masks, step)
+                loss = loss_fn(low_res_masks, labels)
+                score -= loss.item()
 
-            _loss_name = f"{loss_fn.__class__.__name__}/valid"
-            writer.add_scalar(f"{_loss_name}", loss.item(), step)
-            _loader.set_postfix_str(f"{_loss_name}: {loss.item():.4f}")
-        
-        score /= len(valid_loader)
-        if score > best_score:
-            print(f"New best score! >> {score:.4f} (was {best_score:.4f})")        
-            best_score = score
-            if save_model:
-                _model_filepath = os.path.join(output_dir, f"model_{epoch}.pth")
-                print(f"Saving model to {_model_filepath}")
-                torch.save(model.state_dict(), _model_filepath)
+                _loss_name = f"{loss_fn.__class__.__name__}/valid/{_dataset_id}"
+                writer.add_scalar(_loss_name, loss.item(), step)
+                _loader.set_postfix_str(f"{_loss_name}: {loss.item():.4f}")
+            
+            # Overwrite best score if it is better
+            score /= len(_dataloader)
+            if score > best_score_dict[_score_name]:
+                print(f"New best score! >> {score:.4f} (was {best_score_dict[_score_name]:.4f})")        
+                best_score_dict[_score_name] = score
+                if save_model:
+                    _model_filepath = os.path.join(output_dir, f"model_best_{_dataset_id}.pth")
+                    print(f"Saving model to {_model_filepath}")
+                    torch.save(model.state_dict(), _model_filepath)
 
-        # Flush writer
+        # Flush writer every epoch
         writer.flush()
     writer.close()
-
     return score
 
+def sweep_episode(hparams) -> float:
+
+    # Print hyperparam dict with logging
+    print(f"\n\n Starting EPISODE \n\n")
+    print(f"\n\nHyperparams:\n\n{pprint.pformat(hparams)}\n\n")
+
+    # Create output directory based on run_name
+    run_name: str = str(uuid.uuid4())[:8]
+    output_dir = os.path.join(OUTPUT_DIR, run_name)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Train and Validation directories
+    train_dir = os.path.join(DATA_DIR, hparams['train_dir_name'])
+    valid_dir = os.path.join(DATA_DIR, hparams['valid_dir_name'])
+
+    # Save hyperparams to file with YAML
+    with open(os.path.join(output_dir, 'hparams.yaml'), 'w') as f:
+        yaml.dump(hparams, f)
+
+    # HACK: Convert Hyperparam strings to correct format
+    hparams['crop_size'] = [int(x) for x in hparams['crop_size_str'].split('.')]
+    hparams['label_size'] = [int(x) for x in hparams['label_size_str'].split('.')]
+    model, weights_filepath = hparams['model_str'].split('|')
+    weights_filepath = os.path.join(MODEL_DIR, weights_filepath)
+
+    try:
+        writer = SummaryWriter(log_dir=output_dir)
+        # Train and evaluate a TFLite model
+        score_dict = train_valid(
+            output_dir = output_dir,
+            train_dir = train_dir,
+            valid_dir = valid_dir,
+            model=model,
+            weights_filepath=weights_filepath,
+            writer=writer,
+            **hparams,
+        )
+        writer.add_hparams(hparams, score_dict)
+        writer.close()
+        # Score is average of all scores
+        score = sum(score_dict.values()) / len(score_dict)
+    except Exception as e:
+        print(f"\n\n (ERROR) EPISODE FAILED (ERROR) \n\n")
+        print(e)
+        print(f"Potentially Bad Hyperparams:\n\n{pprint.pformat(hparams)}\n\n")
+        score = 0
+    # Maximize score is minimize negative score
+    return -score
+
+
 if __name__ == "__main__":
-    
-        
-    train_valid(
-        train_dir = "C:\\Users\\ook\\Documents\\dev\\ashenvenus\\data\\split_train\\1",
-        valid_dir = "C:\\Users\\ook\\Documents\\dev\\ashenvenus\\data\\split_valid\\1",
-        output_dir = "C:\\Users\\ook\\Documents\\dev\\segment-anything\\output\\",
-        weights_filepath = "C:\\Users\\ook\\Documents\\dev\\segment-anything\\models\\sam_vit_b_01ec64.pth",
-        model = "vit_b",
-        # num_samples_train = 64,
-        # device="cuda",
+
+    # Clean output dir    
+    shutil.rmtree(OUTPUT_DIR, ignore_errors=True)
+
+    best = fmin(
+        sweep_episode,
+        space=HYPERPARAMS,
+        algo=tpe.suggest,
+        max_evals=100,
+        rstate=np.random.Generator(np.random.PCG64(42)),
     )
