@@ -341,7 +341,7 @@ def train_valid(
                             _point_image[0, 0, _height-point_width:_height+point_width, _width-point_width:_width+point_width] = 255
                         else:
                             _point_image[0, 1, _height-point_width:_height+point_width, _width-point_width:_width+point_width] = 255
-                    writer.add_images(f"input.points/valid/{_dataset_id}", _point_image, step)
+                    writer.add_images(f"input.points/valid/{_dataset_id}", _point_image, valid_step)
 
                 image_embeddings = model.image_encoder(images)
                 sparse_embeddings, dense_embeddings = model.prompt_encoder(
