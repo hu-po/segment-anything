@@ -251,13 +251,21 @@ def train_valid(
                 if writer:
                     writer.add_images("input.image/train", images, step)
                     writer.add_images("input.label/train", labels*255, step)
-                # # Plot point coordinates into a blank image of size images
-                # point_coords = point_coords.cpu().numpy()
-                # point_labels = point_labels.cpu().numpy()
-                # point_image = np.zeros(images.shape)
-                # for i in range(point_coords.shape[0]):
-                #     point_image[0, point_coords[i, 0], point_coords[i, 1]] = point_labels[i]
-                # writer.add_images("Train.Points", point_image, step)
+
+                    # Plot point coordinates into a blank image of size images
+                    _point_coords = point_coords.cpu().numpy()
+                    _point_labels = point_labels.cpu().numpy()
+                    _point_image = np.zeros((1, 3, images.shape[2], images.shape[3]), dtype=np.uint8)
+                    point_width = 4
+                    for i in range(_point_coords.shape[1]):
+                        _height = _point_coords[0, i, 0]
+                        _width = _point_coords[0, i, 1]
+                        if _point_labels[0, i] == 0:
+                            _point_image[0, 0, _height-point_width:_height+point_width, _width-point_width:_width+point_width] = 255
+                        else:
+                            _point_image[0, 1, _height-point_width:_height+point_width, _width-point_width:_width+point_width] = 255
+                    writer.add_images(f"input.points/train/{_dataset_id}", _point_image, step)
+
                 image_embeddings = model.image_encoder(images)
                 sparse_embeddings, dense_embeddings = model.prompt_encoder(
                     points=(point_coords, point_labels),
@@ -313,11 +321,28 @@ def train_valid(
             if _score_name not in best_score_dict:
                 best_score_dict[_score_name] = 0
             score = 0
+            valid_step = 0
             _loader = tqdm(_dataloader)
             for images, point_coords, point_labels, labels in _loader:
                 if writer:
-                    writer.add_images(f"input.image/valid/{_dataset_id}", images, step)
-                    writer.add_images(f"input.label/valid/{_dataset_id}", labels, step)
+                    valid_step += 1
+                    writer.add_images(f"input.image/valid/{_dataset_id}", images, valid_step)
+                    writer.add_images(f"input.label/valid/{_dataset_id}", labels*255, valid_step)
+
+                    # Plot point coordinates into a blank image of size images
+                    _point_coords = point_coords.cpu().numpy()
+                    _point_labels = point_labels.cpu().numpy()
+                    _point_image = np.zeros((1, 3, images.shape[2], images.shape[3]), dtype=np.uint8)
+                    point_width = 4
+                    for i in range(_point_coords.shape[1]):
+                        _height = _point_coords[0, i, 0]
+                        _width = _point_coords[0, i, 1]
+                        if _point_labels[0, i] == 0:
+                            _point_image[0, 0, _height-point_width:_height+point_width, _width-point_width:_width+point_width] = 255
+                        else:
+                            _point_image[0, 1, _height-point_width:_height+point_width, _width-point_width:_width+point_width] = 255
+                    writer.add_images(f"input.points/valid/{_dataset_id}", _point_image, step)
+
                 image_embeddings = model.image_encoder(images)
                 sparse_embeddings, dense_embeddings = model.prompt_encoder(
                     points=(point_coords, point_labels),
@@ -399,7 +424,7 @@ def sweep_episode(hparams) -> float:
     except Exception as e:
         print(f"\n\n (ERROR) EPISODE FAILED (ERROR) \n\n")
         print(f"Potentially Bad Hyperparams:\n\n{pprint.pformat(hparams)}\n\n")
-        raise e
+        # raise e
         print(e)
         score = 0
     # Score is average of all scores
