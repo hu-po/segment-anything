@@ -54,8 +54,7 @@ HYPERPARAMS = {
         8,
     ]),
     'crop_size_str': hp.choice('crop_size_str', [
-        '3.68.68',
-        '3.224.224',
+        '3.1024.1024', # HACK: This cannot be changed for pretrained models
     ]),
     'label_size_str': hp.choice('label_size_str', [
         '256.256', # HACK: This cannot be changed for pretrained models
@@ -127,22 +126,22 @@ class FragmentDataset(Dataset):
         # Open Label image
         if self.train:
             _image_labels_filepath = os.path.join(data_dir, image_labels_filename)
-            self.labels = np.array(cv2.imread(_image_labels_filepath, cv2.IMREAD_GRAYSCALE)).astype(np.bool)
+            self.labels = np.array(cv2.imread(_image_labels_filepath, cv2.IMREAD_GRAYSCALE)).astype(np.uint8)
         # Slices
         self.slice_dir = os.path.join(data_dir, slices_dir_filename)
         # Sample random crops within the image
         self.indices = np.zeros((dataset_size, 2, 3), dtype=np.int64)
         for i in range(dataset_size):
             # Select a random starting point for the subvolume
-            _depth = int(np.clip(np.random.normal(avg_depth, std_depth), min_depth, max_depth))
-            _height = np.random.randint(0, self.original_size[0])
-            _width = np.random.randint(0, self.original_size[1])
-            self.indices[i, 0, :] = [_depth, _height, _width]
+            start_depth = int(np.clip(np.random.normal(avg_depth, std_depth), min_depth, max_depth))
+            start_height = np.random.randint(0, self.original_size[0] - self.crop_size[1])
+            start_width = np.random.randint(0, self.original_size[1] - self.crop_size[2])
+            self.indices[i, 0, :] = [start_depth, start_height, start_width]
             # End point is start point + crop size
             self.indices[i, 1, :] = [
-                _depth + self.crop_size[0],
-                _height + self.crop_size[1],
-                _width + self.crop_size[2],
+                start_depth + self.crop_size[0],
+                start_height + self.crop_size[1],
+                start_width + self.crop_size[2],
             ]
 
     def __len__(self):
@@ -165,8 +164,7 @@ class FragmentDataset(Dataset):
 
         # Choose Points within the crop for SAM to sample
         point_coords = np.zeros((self.points_per_crop, 2), dtype=np.int64)
-        # TODO: What is the datatype for labels? One-hot? Binary?
-        point_labels = np.zeros(self.points_per_crop, dtype=np.bool)
+        point_labels = np.zeros(self.points_per_crop, dtype=np.uint8)
         for i in range(self.points_per_crop):
             point_coords[i, 0] = np.random.randint(0, self.crop_size[1])
             point_coords[i, 1] = np.random.randint(0, self.crop_size[2])
@@ -178,9 +176,9 @@ class FragmentDataset(Dataset):
         point_labels = torch.from_numpy(point_labels).to(device=self.device)
 
         if self.train:
-            label = self.labels[start[1]:end[1], start[2]:end[2]]
-            label = cv2.resize(label.astype(np.uint8), self.label_size, interpolation=cv2.INTER_NEAREST)
-            label = torch.from_numpy(label).to(dtype=torch.bool)
+            raw_label = self.labels[start[1]:end[1], start[2]:end[2]]
+            label = cv2.resize(raw_label.astype(np.uint8), self.label_size, interpolation=cv2.INTER_NEAREST)
+            label = torch.from_numpy(label).to(dtype=torch.float32)
             label = label.unsqueeze(0).clone().to(device=self.device)
             return image, point_coords, point_labels, label
         else:
@@ -217,15 +215,17 @@ def train_valid(
     device = get_device(device)  
     # TODO: Select only a subset of model parameters to train
     model = sam_model_registry[model](checkpoint=weights_filepath)
+    model.to(device=device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
     loss_fn = torch.nn.BCEWithLogitsLoss()
 
     step = 0
     best_score_dict: Dict[str, float] = {}
     for epoch in range(num_epochs):
-        print(f"\n\n --- Epoch {epoch} --- \n\n")
+        print(f"\n\n --- Epoch {epoch+1} of {num_epochs} --- \n\n")
 
         # Training
+        model.train()
         for _dataset_id in curriculum:
             _dataset_filepath = os.path.join(train_dir, _dataset_id)
             print(f"Training on {_dataset_filepath} ...")
@@ -250,7 +250,7 @@ def train_valid(
             for images, point_coords, point_labels, labels in _loader:
                 if writer:
                     writer.add_images("input.image/train", images, step)
-                    writer.add_images("input.label/train", labels, step)
+                    writer.add_images("input.label/train", labels*255, step)
                 # # Plot point coordinates into a blank image of size images
                 # point_coords = point_coords.cpu().numpy()
                 # point_labels = point_labels.cpu().numpy()
@@ -282,11 +282,13 @@ def train_valid(
                 step += 1
 
                 _loss_name = f"{loss_fn.__class__.__name__}/train"
-                writer.add_scalar(f"{_loss_name}", loss.item(), step)
                 _loader.set_postfix_str(f"{_loss_name}: {loss.item():.4f}")
+                if writer:
+                    writer.add_scalar(f"{_loss_name}", loss.item(), step)
             
         # Validation
         #   - Will overwrite the dataset and dataloader objects
+        model.eval()
         for _dataset_id in curriculum:
             _dataset_filepath = os.path.join(valid_dir, _dataset_id)
             print(f"Validating on dataset: {_dataset_filepath}")
@@ -335,8 +337,9 @@ def train_valid(
                 score -= loss.item()
 
                 _loss_name = f"{loss_fn.__class__.__name__}/valid/{_dataset_id}"
-                writer.add_scalar(_loss_name, loss.item(), step)
                 _loader.set_postfix_str(f"{_loss_name}: {loss.item():.4f}")
+                if writer:
+                    writer.add_scalar(_loss_name, loss.item(), step)
             
             # Overwrite best score if it is better
             score /= len(_dataloader)
@@ -351,7 +354,7 @@ def train_valid(
         # Flush writer every epoch
         writer.flush()
     writer.close()
-    return score
+    return best_score_dict
 
 def sweep_episode(hparams) -> float:
 
@@ -393,14 +396,14 @@ def sweep_episode(hparams) -> float:
         )
         writer.add_hparams(hparams, score_dict)
         writer.close()
-        # Score is average of all scores
-        score = sum(score_dict.values()) / len(score_dict)
     except Exception as e:
         print(f"\n\n (ERROR) EPISODE FAILED (ERROR) \n\n")
         print(f"Potentially Bad Hyperparams:\n\n{pprint.pformat(hparams)}\n\n")
         raise e
         print(e)
         score = 0
+    # Score is average of all scores
+    score = sum(score_dict.values()) / len(score_dict)
     # Maximize score is minimize negative score
     return -score
 
