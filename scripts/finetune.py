@@ -23,8 +23,12 @@ from typing import Tuple
 class FragmentDataset(Dataset):
     def __init__(
         self,
-        # Directory containing the datasets
+        # Directory containing the dataset
         data_dir: str,
+        # Number of random crops to take from fragment volume
+        dataset_size: int = 16,
+        # Number of points to sample per crop
+        points_per_crop: int = 4,
         # Filenames of the images we'll use
         image_mask_filename='mask.png',
         image_labels_filename='inklabels.png',
@@ -32,145 +36,73 @@ class FragmentDataset(Dataset):
         # Expected slices per fragment
         crop_size: Tuple[int] = (3, 256, 256),
         label_size: Tuple[int] = (256, 256),
-        # Number of subvolumes to extract from each image
-        num_samples: int = 2,
-        # Mean and STD for sampling slices
-        mean: float = 30,
-        std_dev: float = 10,
-        # Min and Max values for sampling slices
-        min_value: int = 0,
-        max_value: int = 65,
-        # Image resize ratio
-        resize_ratio: float = 1.0,
+        # Depth in scan is a Clipped Normal distribution
+        min_depth: int = 0,
+        max_depth: int = 65,
+        avg_depth: float = 27,
+        std_depth: float = 10,
         # Training vs Testing mode
         train: bool = True,
         # Device to use
         device: str = 'cuda',
-        # Number of points to sample per crop
-        points_per_crop: int = 20,
+
     ):
-        print('Initializing Dataset')
-        self.device = device
-        # Train mode also loads the labels
-        self.train = train
+        print(f'Making Dataset from {data_dir}')
+        self.dataset_size = dataset_size
         self.points_per_crop = points_per_crop
-        # Resize ratio reduces the size of the image
-        self.resize_ratio = resize_ratio
-        assert os.path.exists(
-            data_dir), f"Data directory {data_dir} does not exist"
+        self.train = train
+        self.device = device
         # Open Mask image
         _image_mask_filepath = os.path.join(data_dir, image_mask_filename)
-        _mask_img = cv2.imread(_image_mask_filepath, cv2.IMREAD_GRAYSCALE)
-        # Get original size and resized size
-        self.height_original = _mask_img.shape[0]
-        self.width_original = _mask_img.shape[1]
-        self.height_resize = int(self.height_original * self.resize_ratio)
-        self.width_resize = int(self.width_original * self.resize_ratio)
-        self.depth_crop = crop_size[0]
-        self.height_crop = crop_size[1]
-        self.width_crop = crop_size[2]
+        self.mask = np.array(cv2.imread(_image_mask_filepath, cv2.IMREAD_GRAYSCALE)).astype(np.bool)
+        # Image dimmensions (depth, height, width)
+        self.original_size = self.mask.shape
+        self.crop_size = crop_size
         self.label_size = label_size
-        mask_img = cv2.resize(_mask_img, (self.width_resize, self.height_resize))
-        self.mask = torch.from_numpy(np.array(mask_img)).to(dtype=torch.float32)
-        self.mask = torch.nn.functional.pad(
-            self.mask,
-            (
-                self.height_crop // 2, self.height_crop // 2,
-                self.width_crop // 2, self.width_crop // 2,
-            ),
-            mode='constant',
-            value=0,
-        )
+        # Open Label image
         if self.train:
-            # Open Label image
             _image_labels_filepath = os.path.join(data_dir, image_labels_filename)
-            _labels_img = cv2.imread(_image_labels_filepath, cv2.IMREAD_GRAYSCALE)
-            labels_img = cv2.resize(_labels_img, (self.width_resize, self.height_resize))
-            self.labels = torch.from_numpy(np.array(labels_img)).to(dtype=torch.float32)
-            self.labels = torch.nn.functional.pad(
-                self.labels,
-                (
-                    self.height_crop // 2, self.height_crop // 2,
-                    self.width_crop // 2, self.width_crop // 2,
-                ),
-                mode='constant',
-                value=0,
-            )
-
+            self.labels = np.array(cv2.imread(_image_labels_filepath, cv2.IMREAD_GRAYSCALE)).astype(np.bool)
+        # Slices
         self.slice_dir = os.path.join(data_dir, slices_dir_filename)
-        self.num_samples = num_samples
-        self.indices_start = np.zeros((num_samples, 3), dtype=np.int64)
-        self.indices_end = np.zeros((num_samples, 3), dtype=np.int64)
-        for i in range(num_samples):
-
+        # Sample random crops within the image
+        self.indices = np.zeros((dataset_size, 2, 3), dtype=np.int64)
+        for i in range(dataset_size):
             # Select a random starting point for the subvolume
-            d_start = int(np.clip(np.random.normal(mean, std_dev), min_value, max_value - 2))
-            h_start = np.random.randint(self.height_resize // 2,
-                                        self.height_resize - self.height_crop // 2)
-            w_start = np.random.randint(self.width_resize // 2,
-                                        self.width_resize - self.width_crop // 2)
-
-            # Populate the indices matrices
-            self.indices_start[i, :] = [d_start, h_start, w_start]
-            self.indices_end[i, :] = [
-                d_start + self.depth_crop,
-                h_start + self.height_crop,
-                w_start + self.width_crop,
+            _depth = int(np.clip(np.random.normal(avg_depth, std_depth), min_depth, max_depth))
+            _height = np.random.randint(self.crop_size[1] // 2, self.original_size[0] - self.crop_size[1] // 2)
+            _width = np.random.randint(self.crop_size[2] // 2, self.original_size[1] - self.crop_size[2] // 2)
+            self.indices[i, 0, :] = [_depth, _height, _width]
+            # End point is start point + crop size
+            self.indices[i, 1, :] = [
+                _depth + self.crop_size[0],
+                _height + self.crop_size[1],
+                _width + self.crop_size[2],
             ]
 
     def __len__(self):
-        return self.num_samples
+        return self.dataset_size
+    
+    def _make_pixel_stats(self):
+        pass
 
     def __getitem__(self, idx):
-        """
+        # Start and End points for the crop in pixel space
+        start = self.indices[idx, 0, :]
+        end = self.indices[idx, 1, :]
+        # Load the relevant slices and pack into image tensor
+        image = torch.zeros(self.crop_size, dtype=torch.float32)
+        for i, _depth in enumerate(range(start[0], end[0])):
+            _slice_filepath = os.path.join(self.slice_dir, f"{_depth:02d}.tif")
+            _slice = np.array(cv2.imread(_slice_filepath, cv2.IMREAD_GRAYSCALE)).astype(np.float32)
+            image[i, :, :] = _slice[
+                start[1] + self.crop_size[1] // 2 : end[1] - self.crop_size[1] // 2,
+                start[2] + self.crop_size[2] // 2 : end[2] - self.crop_size[2] // 2,
+            ]
+        image = image.to(device=self.device)
+        
 
-        Should Return:
-
-          batched_input (list(dict)): A list over input images, each a
-            dictionary with the following keys. A prompt key can be
-            excluded if it is not present.
-              'image': The image as a torch tensor in 3xHxW format,
-                already transformed for input to the model.
-              'original_size': (tuple(int, int)) The original size of
-                the image before transformation, as (H, W).
-              'point_coords': (torch.Tensor) Batched point prompts for
-                this image, with shape BxNx2. Already transformed to the
-                input frame of the model.
-              'point_labels': (torch.Tensor) Batched labels for point prompts,
-                with shape BxN.
-              'boxes': (torch.Tensor) Batched box inputs, with shape Bx4.
-                Already transformed to the input frame of the model.
-              'mask_inputs': (torch.Tensor) Batched mask inputs to the model,
-                in the form Bx1xHxW.
-          multimask_output (bool): Whether the model should predict multiple
-            disambiguating masks, or return a single mask.
-
-        """
-        start = self.indices_start[idx, :]
-        end = self.indices_end[idx, :]
-        crop = torch.zeros((
-            self.depth_crop,
-            self.height_crop,
-            self.width_crop,
-        ), dtype=torch.float32)
-        for i, slice in enumerate(range(start[0], end[0])):
-            slice_filepath = os.path.join(self.slice_dir, f"{slice:02d}.tif")
-            cv2_img = cv2.imread(slice_filepath, cv2.IMREAD_GRAYSCALE)
-            cv2_img = cv2.resize(cv2_img, (self.width_resize, self.height_resize))
-            cv2_img = torch.from_numpy(np.array(cv2_img)).to(dtype=torch.float32)
-            cv2_img = torch.nn.functional.pad(
-                cv2_img,
-                (
-                    self.height_crop // 2, self.height_crop // 2,
-                    self.width_crop // 2, self.width_crop // 2,
-                ),
-                mode='constant',
-                value=0,
-            )
-            crop[i, :, :] = cv2_img[start[1]:end[1], start[2]:end[2]]
-        image = crop.to(device=self.device)
-
-        # Choose N random points within the crop
+        # Choose Points within the crop for SAM to sample
         point_coords = torch.zeros((self.points_per_crop, 2), dtype=torch.long)
         point_labels = torch.zeros(self.points_per_crop, dtype=torch.long)
         for i in range(self.points_per_crop):
@@ -218,7 +150,7 @@ def train_valid(
 ):
     train_dataset = FragmentDataset(
         data_dir=train_dir,
-        num_samples=num_samples_train,
+        dataset_size=num_samples_train,
         crop_size=crop_size,
         resize_ratio=resize_ratio,
         train=True,
@@ -232,7 +164,7 @@ def train_valid(
     )
     valid_dataset = FragmentDataset(
         data_dir=valid_dir,
-        num_samples=num_samples_valid,
+        dataset_size=num_samples_valid,
         crop_size=crop_size,
         resize_ratio=resize_ratio,
         train=True,
