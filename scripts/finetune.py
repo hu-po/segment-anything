@@ -197,7 +197,7 @@ class FragmentDataset(Dataset):
             return image, point_coords, point_labels
 
 def train_valid(
-    output_dir: str = "output/train",
+    output_dir: str = "/home/tren/dev/segment-anything/output/train",
     train_dir: str = "/home/tren/dev/ashenvenus/data/split_train/1",
     valid_dir: str = "/home/tren/dev/ashenvenus/data/split_valid/1",
     model: str = "vit_b",
@@ -253,19 +253,32 @@ def train_valid(
     writer = SummaryWriter(log_dir=output_dir)
 
     step = 0
-    num_epochs = 2
+    score = 0    
+    best_score = 0
     for epoch in range(num_epochs):
-        print(f"Epoch {epoch}")
-        loader = tqdm(train_loader)
-        for batch in loader:
-            images, point_coords, point_labels, labels = batch
+        print(f"\n\n --- Epoch {epoch} --- \n\n")
+
+        print("Training...")
+        score = 0
+        _loader = tqdm(train_loader)
+        for images, point_coords, point_labels, labels in _loader:
+            writer.add_images("input.image/train", images, step)
+            writer.add_images("input.label/train", labels, step)
+            # # Plot point coordinates into a blank image of size images
+            # point_coords = point_coords.cpu().numpy()
+            # point_labels = point_labels.cpu().numpy()
+            # point_image = np.zeros(images.shape)
+            # for i in range(point_coords.shape[0]):
+            #     point_image[0, point_coords[i, 0], point_coords[i, 1]] = point_labels[i]
+            # writer.add_images("Train.Points", point_image, step)
             image_embeddings = model.image_encoder(images)
             sparse_embeddings, dense_embeddings = model.prompt_encoder(
                 points=(point_coords, point_labels),
                 boxes=None,
                 masks=None,
             )
-            # Something goes on here for batch sizes greater than 1
+            # HACK: Something goes on here for batch sizes greater than 1
+            # TODO: iou predictions could be used for additional loss
             low_res_masks, iou_predictions = model.mask_decoder(
                 image_embeddings=image_embeddings,
                 image_pe=model.prompt_encoder.get_dense_pe(),
@@ -273,25 +286,68 @@ def train_valid(
                 dense_prompt_embeddings=dense_embeddings,
                 multimask_output=False,
             )
+            writer.add_images("output.masks/train", low_res_masks, step)
             loss = loss_fn(low_res_masks, labels)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             step += 1
 
-            loss_name = f"Train.{loss_fn.__class__.__name__}"
-            writer.add_scalar(loss_name, loss.item(), step)
-            loader.set_postfix_str(f"{loss_name}: {loss.item():.4f}")
+            _loss_name = f"{loss_fn.__class__.__name__}/train"
+            writer.add_scalar(f"{_loss_name}", loss.item(), step)
+            _loader.set_postfix_str(f"{_loss_name}: {loss.item():.4f}")
         
-        if save_model:
-            _model_filepath = os.path.join(output_dir, f"model_{epoch}.pth")
-            print(f"Saving model to {_model_filepath}")
-            torch.save(model.state_dict(), _model_filepath)
+        print("Validating...")
+        score = 0
+        _loader = tqdm(valid_loader)
+        for images, point_coords, point_labels, labels in _loader:
+            writer.add_images("input.image/valid", images, step)
+            writer.add_images("input.label/valid", labels, step)
+            image_embeddings = model.image_encoder(images)
+            sparse_embeddings, dense_embeddings = model.prompt_encoder(
+                points=(point_coords, point_labels),
+                boxes=None,
+                masks=None,
+            )
+            low_res_masks, iou_predictions = model.mask_decoder(
+                image_embeddings=image_embeddings,
+                image_pe=model.prompt_encoder.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=False,
+            )
+            writer.add_images("output.masks/valid", low_res_masks, step)
+            loss = loss_fn(low_res_masks, labels)
+            score -= loss.item()
 
+            _loss_name = f"{loss_fn.__class__.__name__}/valid"
+            writer.add_scalar(f"{_loss_name}", loss.item(), step)
+            _loader.set_postfix_str(f"{_loss_name}: {loss.item():.4f}")
+        
+        score /= len(valid_loader)
+        if score > best_score:
+            print(f"New best score! >> {score:.4f} (was {best_score:.4f})")        
+            best_score = score
+            if save_model:
+                _model_filepath = os.path.join(output_dir, f"model_{epoch}.pth")
+                print(f"Saving model to {_model_filepath}")
+                torch.save(model.state_dict(), _model_filepath)
+
+        # Flush writer
+        writer.flush()
     writer.close()
-        # # Validation
+
+    return score
 
 if __name__ == "__main__":
     
-    
-    train_valid()
+        
+    train_valid(
+        train_dir = "C:\\Users\\ook\\Documents\\dev\\ashenvenus\\data\\split_train\\1",
+        valid_dir = "C:\\Users\\ook\\Documents\\dev\\ashenvenus\\data\\split_valid\\1",
+        output_dir = "C:\\Users\\ook\\Documents\\dev\\segment-anything\\output\\",
+        model = "vit_b",
+        weights_filepath = "C:\\Users\\ook\\Documents\\dev\\segment-anything\\models\\sam_vit_b_01ec64.pth",
+        # num_samples_train = 64,
+        # device="cuda",
+    )
