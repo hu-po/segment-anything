@@ -346,8 +346,8 @@ if __name__ == "__main__":
         train_dir = "C:\\Users\\ook\\Documents\\dev\\ashenvenus\\data\\split_train\\1",
         valid_dir = "C:\\Users\\ook\\Documents\\dev\\ashenvenus\\data\\split_valid\\1",
         output_dir = "C:\\Users\\ook\\Documents\\dev\\segment-anything\\output\\",
-        model = "vit_b",
         weights_filepath = "C:\\Users\\ook\\Documents\\dev\\segment-anything\\models\\sam_vit_b_01ec64.pth",
+        model = "vit_b",
         # num_samples_train = 64,
         # device="cuda",
     )
